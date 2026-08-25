@@ -7,9 +7,43 @@ import { homedir } from "os";
 import { createServer } from "http";
 import { createHash } from "crypto";
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import { buildWizard } from "./bro-build.mjs";
+import { createUpgradeManager, formatUpgradeReport } from "./agent-upgrade.mjs";
+import { createContinuityEngine } from "./bro-continuity.mjs";
+import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, formatModelList, modelPreferencePath } from "./model-selector.mjs";
 
 const require = createRequire(import.meta.url);
+
+// ── .env loader ──────────────────────────────────────────────
+// Auto-loads KEY=VALUE pairs so BRO finds its LLM keys without you
+// exporting them. Checks, in order: current directory, this script's
+// folder, then ~/.bro/.env. Real environment variables always win.
+(function loadDotEnv(){
+  var candidates = [
+    join(process.cwd(), ".env"),
+    join(dirname(fileURLToPath(import.meta.url)), ".env"),
+    join(homedir(), ".bro", ".env")
+  ];
+  for (var i=0;i<candidates.length;i++){
+    var seen = {};
+    try{
+      if(!existsSync(candidates[i])) continue;
+      readFileSync(candidates[i], "utf8").split(/\r?\n/).forEach(function(line){
+        line = line.trim();
+        if(!line || line.startsWith("#") || seen[line]) return;
+        seen[line] = true;
+        line = line.replace(/^export\s+/,"");
+        var eq = line.indexOf("=");
+        if(eq === -1) return;
+        var k = line.substring(0,eq).trim();
+        var v = line.substring(eq+1).trim().replace(/^["']|["']$/g,"");
+        if(!k) return;
+        if(!process.env[k]) process.env[k] = v;
+      });
+    }catch(e){ /* unreadable .env - skip */ }
+  }
+})();
 
 // bromance.mjs powers /bromance, /skills list, /chain, /brofile, etc. - all of it
 // reads from globalThis.__bromance, but nothing was ever setting that global, so
@@ -36,7 +70,7 @@ await loadBromanceModule();
 const commandList = [
   '/help', '/status', '/queue', '/memory', '/thought', 
   '/paste', '/exit', '/quit', '/build', '/skills', 
-  '/auto', '/tg', '/chain', '/k1', '/tier', '/upgrade'
+  '/auto', '/tg', '/chain', '/k1', '/tier', '/upgrade', '/models', '/model', '/continuity'
 ];
 
 // Corrected initialization with the comma added
@@ -99,6 +133,14 @@ rl.on("line", function(line){
   // Explicit /paste mode already accumulates lines itself and needs to see
   // each one individually (to detect /end) - bypass coalescing entirely.
   if (isPasting || line.trim() === "/paste") {
+    inputQueue.push(line);
+    drainInputQueue();
+    return;
+  }
+  // Non-TTY (piped/scripted) input: every line is a deliberate command - process
+  // it immediately. Coalescing is only for real interactive pastes, where a
+  // human's multi-line paste arrives as one burst and should become one message.
+  if (!process.stdin.isTTY) {
     inputQueue.push(line);
     drainInputQueue();
     return;
@@ -379,21 +421,11 @@ async function tgKeyboardCmd(){
 
 
 function memorySurface(query){
-  var fs2=require("fs"),path2=require("path"),os2=require("os");
-  var f=path2.join(os2.homedir(),".bro","memory.json");
-  var mem={entries:[]};try{mem=JSON.parse(fs2.readFileSync(f,"utf8"));}catch{}
-  if(!mem.entries||!mem.entries.length)return [];
-  var q=(query||"").toLowerCase().split(/\s+/).filter(function(w){return w.length>2;});
-  var now=Date.now();
-  return mem.entries.map(function(e){
-    var text=((e.content||e.text||"")+" "+((e.tags||[]).join(" "))).toLowerCase();
-    var score=0;q.forEach(function(w){if(text.indexOf(w)>=0)score+=10;});
-    var ah=(now-(e.timestamp||e.time||0))/3600000;
-    if(ah<24)score+=5;else if(ah<168)score+=2;else if(ah>1440)score-=3;
-    if(e.tags&&e.tags.indexOf("important")>=0)score+=8;
-    if(e.tags&&e.tags.indexOf("decision")>=0)score+=6;
-    return Object.assign({score:score},e);
-  }).filter(function(e){return e.score>0;}).sort(function(a,b){return b.score-a.score;}).slice(0,3);
+  // Delegates to the continuity engine's scored recall across ALL memory
+  // buckets (facts/observations/decisions/errors/lessons). The old version
+  // read mem.entries - a shape memory.json never had, so it always returned
+  // nothing. Persistence continuity requires actually finding the memories.
+  try{ return continuity.recall(query, 3); }catch(e){ return []; }
 }
 function memorySurfaceShow(query){
   var rgb=function(r,g,b){return"\x1b[38;2;"+r+";"+g+";"+b+"m";};
@@ -402,8 +434,8 @@ function memorySurfaceShow(query){
   if(!hits.length){console.log("  "+D+"No relevant memories surfaced."+R+"\n");return;}
   console.log("\n  "+rgb(180,150,255)+B+"\u{1F9E0} BRO REMEMBERS:"+R);
   hits.forEach(function(h){
-    var p=(h.content||h.text||"").substring(0,160);
-    var w=h.timestamp?new Date(h.timestamp).toISOString().substring(0,10):"";
+    var p=(h.text||h.content||"").substring(0,160);
+    var w=h.time?new Date(h.time).toISOString().substring(0,10):"";
     console.log("  "+rgb(180,150,255)+"\u25C6"+R+" "+D+"["+w+"]"+R+" "+p);
   });
   console.log("");
@@ -816,18 +848,78 @@ var DREAMS_F=join(DATA_DIR,"dreams.json");
 var HEARTBEAT_F=join(DATA_DIR,"heartbeat.json");
 var STATS_F=join(DATA_DIR,"stats.json");
 try{mkdirSync(DATA_DIR,{recursive:true});}catch{}
+var upgradeManager = createUpgradeManager({
+  rootDir: process.cwd(),
+  logger: function(message){ try{ lg(message); }catch{} }
+});
+// Continuity & Emergence engine — long-term memory recall (facts/observations/
+// decisions/errors/lessons), session rollup briefs, and the failure->lesson
+// reflection loop that feeds FVSMB-verified self-improvement blueprints.
+var continuity = createContinuityEngine({ dataDir: DATA_DIR });
 
 var TOKEN=process.env.BASE44_TOKEN||"";
-var APP="69d81ac3ffa24327b49b171a",CONV="69f9a8f3e048816e89717604",MAX_DEPTH=5,MAX_OUT=15000;
+var APP="69d81ac3ffa24327b49b171a",CONV="69f9a8f3e048816e89717604",MAX_DEPTH=10,MAX_OUT=15000;
 var GROQ_KEY=process.env.GROQ_KEY||"";
 var TAVILY_KEY=process.env.TAVILY_KEY||"";
 var GITHUB_TOKEN=process.env.GITHUB_TOKEN||"";
+var OPENAI_KEY=process.env.OPENAI_API_KEY||"";
+var MODEL_PREFERENCE_F=modelPreferencePath(DATA_DIR);
+var selectedVertexModel=process.env.GCP_MODEL||loadModelPreference(MODEL_PREFERENCE_F)||"";
+var discoveredVertexModels=[];
+var modelDiscoveryPromise=null;
+function activeVertexModel(){ return selectedVertexModel || process.env.GCP_MODEL || "gemini-2.5-flash"; }
+async function discoverAndSelectVertexModel(force){
+  if(modelDiscoveryPromise&&!force)return modelDiscoveryPromise;
+  modelDiscoveryPromise=(async function(){
+    var context=detectGoogleCloudContext();
+    if(!context.token||!context.projectId)throw new Error("Google Cloud credentials/project not detected");
+    var result=await discoverVertexModels({context:context});
+    discoveredVertexModels=result.models;
+    var next=chooseVertexModel(discoveredVertexModels,selectedVertexModel||process.env.GCP_MODEL||"");
+    selectedVertexModel=next;
+    if(!process.env.GCP_MODEL)saveModelPreference(MODEL_PREFERENCE_F,next);
+    return {context:context,models:discoveredVertexModels,activeModel:next};
+  })();
+  try{return await modelDiscoveryPromise;}catch(e){modelDiscoveryPromise=null;throw e;}
+}
 var GH_CONFIG_F=join(DATA_DIR,"github.json");
 var ghConfig;try{ghConfig=JSON.parse(readFileSync(GH_CONFIG_F,"utf8"));}catch{ghConfig={defaultRepo:""};}
 function saveGhConfig(){try{writeFileSync(GH_CONFIG_F,JSON.stringify(ghConfig,null,2),"utf8");}catch{}}
 
-var CL={reset:"\x1b[0m",bold:"\x1b[1m",dim:"\x1b[2m",red:"\x1b[31m",green:"\x1b[32m",yellow:"\x1b[33m",blue:"\x1b[34m",cyan:"\x1b[36m",magenta:"\x1b[35m"};
+var CL={reset:"\x1b[0m",bold:"\x1b[1m",dim:"\x1b[2m",red:"\x1b[31m",green:"\x1b[32m",yellow:"\x1b[33m",blue:"\x1b[34m",cyan:"\x1b[36m",magenta:"\x1b[35m",
+  // semantic palette
+  good:rgb(0,255,120),      // bright green — fixes that are good
+  bad:rgb(255,70,70),       // bright red — bad
+  bro:rgb(120,200,255),     // light blue — BRO's messaging
+  think:rgb(120,120,140),   // faint — thinking
+  quip:rgb(200,80,255),     // neon purple — quips
+  ask:rgb(255,215,0),       // yellow — BRO's questions / needs a pick
+  gold:rgb(255,215,0)       // alias for the classic gold
+};
 function p(c,t){return CL[c]+t+CL.reset;}
+// Separator line, optionally with a centered label: sep() or sep("SCAN") or sep("SCAN","good")
+function sep(label, color){
+  var c = CL[color||"dim"];
+  var bar = c + "\u2500".repeat(30) + CL.reset;
+  if(label) bar = c + "\u2500".repeat(22) + CL.reset + " " + CL.bold + CL[color||"gold"] + label + CL.reset + " " + c + "\u2500".repeat(22) + CL.reset;
+  console.log("  " + bar);
+}
+// Animated menu header: types the title with a pulsing color shimmer, then a separator.
+async function animHeader(title, color){
+  var base = CL[color||"quip"];
+  var txt = "  " + title;
+  var out = "";
+  for(var i=0;i<txt.length;i++){
+    var pulse = 140 + Math.floor(100*Math.sin(i/2.2));
+    var ch = (i<2) ? CL[color||"quip"] : rgb(Math.min(255,200+Math.floor(pulse*0.3)), Math.min(255,80+Math.floor(pulse*0.5)), 255);
+    out += ch + BOLD + txt[i] + RST;
+  }
+  process.stdout.write(out);
+  await sleep(120);
+  process.stdout.write("\n");
+  sep("", color||"dim");
+  console.log("");
+}
 function lg(m){try{appendFileSync(LOG_F,new Date().toISOString()+" "+m+"\n");}catch{}}
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1371,7 +1463,9 @@ function spin(m, quipCategory){
       spinCurrentText = broQuip(spinQuipCtx);
       spinQuipRefreshedAt = Date.now();
     }
-    process.stdout.write("\r"+CL.cyan+SP2[sii++%SP2.length]+" "+spinCurrentText+CL.reset+"   ");
+    // quips in neon purple, plain thinking text faint
+    var body = spinQuipCtx ? (CL.quip+spinCurrentText+CL.reset) : (CL.think+spinCurrentText+CL.reset);
+    process.stdout.write("\r"+CL.think+SP2[sii++%SP2.length]+CL.reset+" "+body+"   ");
   },80);
 }
 function unspin(){if(stt){clearInterval(stt);stt=null;}spinQuipCtx=null;process.stdout.write("\r"+" ".repeat(60)+"\r");}
@@ -1603,9 +1697,10 @@ async function interactiveSelect(items, opts) {
   });
 }
 
-function showSkillsDashboard(){
+async function showSkillsDashboard(){
   var G=rgb(255,215,0);var P=rgb(180,0,255);var GR=rgb(0,255,100);var R=RST;var B=BOLD;
-  console.log("\n"+G+B+"  \u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550"+R+"\n");
+  if(process.stdout.isTTY){ await animHeader("\u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550", "good"); }
+  else { console.log("\n"+G+B+"  \u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550"+R+"\n"); }
   var cats={core:"CORE",devops:"DEVOPS",connect:"CONNECT",ai:"AI",system:"SYSTEM",security:"SECURITY",cognitive:"COGNITIVE"};
   var lastCat="";
   skills.forEach(function(s){
@@ -1669,11 +1764,29 @@ function memorize(type,text,meta){
   saveMemory();
 }
 function buildMemoryContext(){
-  if(!memory.total_interactions)return"";
-  var ctx="";
-  if(memory.facts.length)ctx+="Known facts:\n"+memory.facts.slice(-5).map(function(f){return"- "+f.text;}).join("\n")+"\n";
-  if(memory.observations.length)ctx+="Recent context:\n"+memory.observations.slice(-5).map(function(o){return"- "+o.text;}).join("\n")+"\n";
-  return ctx;
+  // Delegate to the continuity engine: facts + recent observations + distilled
+  // lessons (from the reflection loop), so the system prompt carries real
+  // cross-session continuity instead of only whatever the old buckets had.
+  try{ return continuity.contextBlock(); }catch(e){ return ""; }
+}
+
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// GOALS (persistent autonomous tasks)
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Goals survive restarts (stored in ~/.bro/goals.json) so BRO can resume
+// half-finished autonomous work across sessions - that's the backbone of
+// real autonomy: state that persists, not just a one-shot chat turn.
+var GOALS_F=join(DATA_DIR,"goals.json");
+var goals;try{goals=JSON.parse(readFileSync(GOALS_F,"utf8"));}catch{goals={entries:[]};}
+function saveGoals(){try{writeFileSync(GOALS_F,JSON.stringify(goals,null,2),"utf8");}catch{}}
+function goalListText(){
+  if(!goals.entries.length)return"";
+  var open=goals.entries.filter(function(g){return !g.done;});
+  var s="";
+  if(open.length)s+="OPEN GOALS (work on these; call <<<TOOL:done SUMMARY>>> when finished):\n"+open.map(function(g,i){return (i+1)+". "+g.text;}).join("\n")+"\n";
+  var doneN=goals.entries.length-open.length;
+  if(doneN)s+="(completed: "+doneN+")\n";
+  return s.trim();
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1794,15 +1907,17 @@ async function dreamCycle(silent){
   saveDreams();return triggered;
 }
 
-function showDreamTree(){
+async function showDreamTree(){
   var G=rgb(255,215,0);var P=rgb(180,0,255);var R=RST;var B=BOLD;
-  console.log("\n"+P+B+"  \u{1F319} BRO DREAM ENGINE"+R+"\n");
+  if(process.stdout.isTTY){ await animHeader("\u{1F319} BRO DREAM ENGINE", "quip"); }
+  else { console.log("\n"+P+B+"  \u{1F319} BRO DREAM ENGINE"+R+"\n"); }
   if(dreams.entries.length===0){console.log("  "+p("dim","No dreams yet. BRO dreams during idle heartbeats.\n"));return;}
   var groups={nightmare:[],warning:[],insight:[],dream:[]};
   dreams.entries.slice(-30).forEach(function(d){if(groups[d.type])groups[d.type].push(d);});
-  var icons={nightmare:p("red","\u2588 NIGHTMARES"),warning:p("yellow","\u2588 WARNINGS"),insight:p("cyan","\u2588 INSIGHTS"),dream:p("magenta","\u2588 DREAMS")};
+  var icons={nightmare:p("bad","\u2588 NIGHTMARES"),warning:p("ask","\u2588 WARNINGS"),insight:p("bro","\u2588 INSIGHTS"),dream:p("quip","\u2588 DREAMS")};
   Object.keys(groups).forEach(function(type){
     var list=groups[type];if(!list.length)return;
+    sep(type.toUpperCase(), type==="nightmare"?"bad":type==="warning"?"ask":"quip");
     console.log("  "+icons[type]+p("dim"," ("+list.length+")")+R);
     list.slice(-5).forEach(function(d,i){
       var age=Math.floor((Date.now()-d.time)/60000);var ageStr=age<60?age+"m":Math.floor(age/60)+"h";
@@ -1812,6 +1927,7 @@ function showDreamTree(){
     });console.log("");
   });
   var total=dreams.entries.length;var unres=dreams.entries.filter(function(d){return!d.resolved;}).length;
+  sep("", "dim");
   console.log("  "+G+"Total: "+total+" | Unresolved: "+unres+R);
   console.log("  "+p("dim","Resolve: /dream resolve ID | Force: /dream now | Clear: /dream clear\n"));
 }
@@ -1820,113 +1936,344 @@ function showDreamTree(){
 // API + TOOLS
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// VERTEX TOKEN (auto-refresh via gcloud on 401)
+// LLM BRAINS — multi-provider routing.
+// BRO tries every configured brain in order until one answers:
+//   Vertex (gcloud, default) -> Base44 (BASE44_TOKEN) -> Groq (GROQ_KEY)
+//   -> OpenAI-compatible (OPENAI_API_KEY + optional OPENAI_BASE_URL).
+// Keys come from environment variables or a .env file (loaded at the top of
+// this file). Force one brain with BRO_BRAIN=vertex|base44|groq|openai.
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 var cachedVertexToken = process.env.VERTEX_OAUTH_TOKEN || "";
 function refreshVertexToken(){
   try{
-    var out = execSync("gcloud auth print-access-token", {encoding:"utf8", timeout:15000}).trim();
+    var out = execSync("gcloud auth print-access-token", {encoding:"utf8", timeout:15000, stdio:["ignore","pipe","ignore"]}).trim();
     if(out){ cachedVertexToken = out; return out; }
-  }catch(e){
-    console.log(p("red","  Failed to refresh gcloud token: "+e.message.split("\n")[0]));
-  }
+  }catch(e){ /* gcloud not installed - vertex brain simply unavailable */ }
   return "";
 }
 
 var cachedGcpProjectId = process.env.GCP_PROJECT_ID || "";
 function detectGcpProjectId(){
   try{
-    var out = execSync("gcloud config get-value project", {encoding:"utf8", timeout:15000}).trim();
+    var out = execSync("gcloud config get-value project", {encoding:"utf8", timeout:15000, stdio:["ignore","pipe","ignore"]}).trim();
     if(out && out !== "(unset)"){ cachedGcpProjectId = out; return out; }
-  }catch(e){ /* gcloud not installed or not configured - caller reports missing credentials */ }
+  }catch(e){ /* not configured - vertex brain unavailable */ }
   return "";
 }
 
-async function askChat(chatHistory, ret, abortSignal){
-  ret=ret||3;
-  stats.apiCalls++;
+// Flattens [{role, parts:[{text}]}] into the plain prompt used by the
+// single-message brains (Base44/Groq/OpenAI-compatible).
+function flattenHistory(chatHistory){
+  return (chatHistory||[]).map(function(m){
+    var text = (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "";
+    var role = m.role === "model" ? "BRO" : (m.role === "user" ? "User" : "System");
+    return "["+role+"]: "+text;
+  }).join("\n\n");
+}
 
-  if (!cachedVertexToken) refreshVertexToken(); // never set via env - try gcloud once
-  if (!cachedGcpProjectId) detectGcpProjectId(); // ditto for the project id
-
-  var PROJECT_ID = cachedGcpProjectId;
-  var REGION = process.env.GCP_REGION || "us-central1";
-  var MODEL = process.env.GCP_MODEL || "gemini-2.5-flash"; 
-
-  if (!cachedVertexToken || !PROJECT_ID) {
-    throw new Error("Missing local credentials. Run 'gcloud auth login' and 'gcloud config set project YOUR_PROJECT_ID' once, then BRO will pick both up automatically from here on.");
+function abortable(abortSignal, ms){
+  return abortSignal ? AbortSignal.any([abortSignal, AbortSignal.timeout(ms||120000)]) : AbortSignal.timeout(ms||120000);
+}
+function userStoppedErr(abortSignal){
+  if(abortSignal && abortSignal.aborted){
+    var stopErr = new Error("Stopped by user");
+    stopErr.userStopped = true;
+    return stopErr;
   }
+  return null;
+}
+// Reads an SSE response body, calling onToken(text) per delta and returning
+// the accumulated text. `extract` maps one parsed data payload -> text delta.
+async function readSSEStream(r, onToken, extract){
+  var content = "";
+  var reader = r.body.getReader();
+  var decoder = new TextDecoder();
+  var buf = "";
+  while(true){
+    var chunk = await reader.read();
+    if(chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream:true });
+    var lines = buf.split("\n");
+    buf = lines.pop();
+    for(var i=0;i<lines.length;i++){
+      var line = lines[i].trim();
+      if(!line.startsWith("data:")) continue;
+      var data = line.slice(5).trim();
+      if(!data || data === "[DONE]") continue;
+      var delta = "";
+      try{ delta = extract(JSON.parse(data)) || ""; }catch(e){}
+      if(delta){ content += delta; if(onToken) onToken(delta); }
+    }
+  }
+  return content;
+}
 
-  var url = `https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:generateContent`;
-
+// --- Brain: Base44 (PassionCraft's own agent API) ---
+async function askBase44(chatHistory, ret, abortSignal, onToken){
+  var msg = buildSys() + "\n\n---\n\n" + flattenHistory(chatHistory);
   for(var i=0;i<ret;i++){
     try{
       var s=Date.now();
-      var timeoutSignal = AbortSignal.timeout(120000);
-      var r=await fetch(url,{
+      var r=await fetch("https://base44.app/api/apps/"+APP+"/agents/conversations/v2/"+CONV+"/messages",{
         method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          "Authorization":"Bearer " + cachedVertexToken
-        },
-        body:JSON.stringify({
-          contents: chatHistory, // Send the structural chat history
-          systemInstruction: {
-            parts: [{ text: buildSys() }]
-          }
-        }),
-        signal: abortSignal ? AbortSignal.any([abortSignal, timeoutSignal]) : timeoutSignal
+        headers:{"Content-Type":"application/json","X-App-Id":APP,"Authorization":"Bearer "+TOKEN},
+        body:JSON.stringify({role:"user",content:msg.substring(0,50000)}),
+        signal: abortable(abortSignal)
       });
-      
       var el=((Date.now()-s)/1000).toFixed(1);
       if(!r.ok){
-        if(r.status===401){
-          var fresh = refreshVertexToken();
-          if(fresh){ continue; } // retry immediately with the new token, doesn't count against sleep-based retries below
-        }
-        if(r.status===429||r.status>=500){
-          await sleep((i+1)*3000);
-          continue;
-        }
-        var errBody = "";
-        try { errBody = " - " + await r.text(); } catch(_) {}
-        throw new Error("Vertex API rejected payload: " + r.status + errBody);
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Base44 API "+r.status+errBody);
       }
-      
       var d=await r.json();
-      var responseText = "";
-      var tokens = 0;
-      
-      if (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts[0]) {
-        responseText = d.candidates[0].content.parts[0].text;
-      }
-      if (d.usageMetadata) {
-        tokens = d.usageMetadata.candidatesTokenCount || 0;
-      }
-      
-      stats.totalTokens+=tokens;
-      saveStat();
-      
-      return {
-        content: responseText,
-        elapsed: el,
-        tokens: tokens
-      };
+      var content = d.content||d.message||"";
+      if(content && onToken) onToken(content); // single-shot brain: deliver as one chunk
+      return { content:content, elapsed:el, tokens:(d.usage?d.usage.completion_tokens:0)||0 };
     }catch(e){
-      if(abortSignal && abortSignal.aborted){
-        var stopErr = new Error("Stopped by user");
-        stopErr.userStopped = true;
-        throw stopErr; // never retry a user-initiated stop
-      }
-      if(i===ret-1){
-        stats.errors++;
-        saveStat();
-        throw e;
-      }
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
       await sleep((i+1)*2000);
     }
   }
-  throw new Error("Failed");
+  throw new Error("Base44 failed");
+}
+
+// --- Brain: Groq (free, fast open models) ---
+async function askGroq(chatHistory, ret, abortSignal, onToken){
+  var messages = [{ role:"system", content: buildSys() }].concat((chatHistory||[]).map(function(m){
+    return { role: m.role === "model" ? "assistant" : "user", content: (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "" };
+  }));
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var body = { model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile", messages: messages };
+      if(onToken) body.stream = true;
+      var r=await fetch("https://api.groq.com/openai/v1/chat/completions",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+GROQ_KEY},
+        body:JSON.stringify(body),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Groq API "+r.status+errBody);
+      }
+      var content="";
+      if(onToken && r.body){
+        content = await readSSEStream(r, onToken, function(d){ return (d.choices&&d.choices[0]&&d.choices[0].delta&&d.choices[0].delta.content)||""; });
+      } else {
+        var d=await r.json();
+        content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"";
+      }
+      return { content:content, elapsed:el, tokens:0 };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("Groq failed");
+}
+
+// --- Brain: Vertex AI (Google, via gcloud — optional) ---
+async function askVertex(chatHistory, ret, abortSignal, onToken){
+  var PROJECT_ID = cachedGcpProjectId;
+  var REGION = process.env.GCP_REGION || "us-central1";
+  if(!selectedVertexModel&&!process.env.GCP_MODEL){
+    try{ await discoverAndSelectVertexModel(false); }catch(_){ /* known default remains the fallback */ }
+  }
+  var MODEL = activeVertexModel();
+  var action = onToken ? "streamGenerateContent?alt=sse" : "generateContent";
+  var url = `https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:${action}`;
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var r=await fetch(url,{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+cachedVertexToken},
+        body:JSON.stringify({ contents: chatHistory, systemInstruction:{ parts:[{ text: buildSys() }] } }),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===401){ var fresh=refreshVertexToken(); if(fresh) continue; }
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Vertex API rejected payload: "+r.status+errBody);
+      }
+      var responseText="", tokens=0;
+      if(onToken && r.body){
+        responseText = await readSSEStream(r, onToken, function(d){
+          var p = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+          return (p && p[0] && p[0].text) || "";
+        });
+      } else {
+        var d=await r.json();
+        if(d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts[0]){
+          responseText=d.candidates[0].content.parts[0].text;
+        }
+        if(d.usageMetadata) tokens=d.usageMetadata.candidatesTokenCount||0;
+      }
+      return { content:responseText, elapsed:el, tokens:tokens };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("Vertex failed");
+}
+
+// --- Brain: OpenAI-compatible (any /v1 endpoint: OpenAI, local, proxies) ---
+async function askOpenAI(chatHistory, ret, abortSignal, onToken){
+  var base = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+  var model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  var messages = [{ role:"system", content: buildSys() }].concat((chatHistory||[]).map(function(m){
+    return { role: m.role === "model" ? "assistant" : "user", content: (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "" };
+  }));
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var body = { model: model, messages: messages };
+      if(onToken) body.stream = true;
+      var r=await fetch(base.replace(/\/$/,"")+"/chat/completions",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+OPENAI_KEY},
+        body:JSON.stringify(body),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("OpenAI API "+r.status+errBody);
+      }
+      var content="";
+      if(onToken && r.body){
+        content = await readSSEStream(r, onToken, function(d){ return (d.choices&&d.choices[0]&&d.choices[0].delta&&d.choices[0].delta.content)||""; });
+      } else {
+        var d=await r.json();
+        content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"";
+      }
+      return { content:content, elapsed:el, tokens:0 };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("OpenAI failed");
+}
+
+// --- Brain: Pollinations (free, no key needed) ---
+async function askPollinations(chatHistory, ret, abortSignal, onToken){
+  var messages = [{ role:"system", content: buildSys() }].concat((chatHistory||[]).map(function(m){
+    return { role: m.role === "model" ? "assistant" : "user", content: (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "" };
+  }));
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var body = { model: "openai", messages: messages };
+      if(onToken) body.stream = true;
+      var r=await fetch("https://text.pollinations.ai/openai/chat/completions",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(body),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody = " - "+await r.text(); }catch(_){}
+        throw new Error("Pollinations API "+r.status+errBody);
+      }
+      var content="";
+      if(onToken && r.body){
+        content = await readSSEStream(r, onToken, function(d){ return (d.choices&&d.choices[0]&&d.choices[0].delta&&d.choices[0].delta.content)||""; });
+      } else {
+        var d=await r.json();
+        content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"";
+      }
+      return { content:content, elapsed:el, tokens:0 };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("Pollinations failed");
+}
+
+// Returns the ordered list of brains that have credentials configured.
+// Priority: gcloud/Vertex first (the user's preferred brain), then Base44,
+// Groq, OpenAI-compatible, Pollinations (free fallback). Force one with BRO_BRAIN=vertex|base44|groq|openai|pollinations.
+function configuredBrains(){
+  if (!cachedVertexToken) refreshVertexToken();
+  if (!cachedGcpProjectId) detectGcpProjectId();
+  var brains = [];
+  // Vertex is intentionally first whenever gcloud context is available.
+  if (cachedVertexToken && cachedGcpProjectId) brains.push({ name:"vertex", label:"Vertex/Google Cloud", call:askVertex });
+  if (TOKEN) brains.push({ name:"base44", label:"Base44", call:askBase44 });
+  if (GROQ_KEY) brains.push({ name:"groq", label:"Groq", call:askGroq });
+  if (OPENAI_KEY) brains.push({ name:"openai", label:"OpenAI", call:askOpenAI });
+  // Pollinations is always available as a free fallback (no key needed)
+  brains.push({ name:"pollinations", label:"Pollinations (free)", call:askPollinations });
+  var forced = (process.env.BRO_BRAIN||"").toLowerCase();
+  if (forced) brains = brains.filter(function(b){ return b.name === forced; });
+  return brains;
+}
+
+// Human-readable summary of what the Vertex/gcloud setup looks like right now.
+function gcloudStatus(){
+  var region = process.env.GCP_REGION || "us-central1";
+  var model = activeVertexModel();
+  if (cachedVertexToken && cachedGcpProjectId){
+    return p("green","READY")+p("dim"," (project "+cachedGcpProjectId+", "+region+", "+model+")");
+  }
+  if (cachedVertexToken && !cachedGcpProjectId){
+    return p("yellow","token OK")+p("dim"," but no project - run: gcloud config set project YOUR_PROJECT_ID");
+  }
+  if (!cachedVertexToken && cachedGcpProjectId){
+    return p("yellow","project OK")+p("dim"," but no token - run: gcloud auth login");
+  }
+  return p("red","not set up")+p("dim"," - run: gcloud auth login && gcloud config set project YOUR_PROJECT_ID");
+}
+
+async function askChat(chatHistory, ret, abortSignal, onToken){
+  ret = ret || 3;
+  stats.apiCalls++;
+
+  var brains = configuredBrains();
+  if (!brains.length) {
+    throw new Error("No LLM brain configured. Set one of these in your environment or a .env file:\n" +
+      "  gcloud auth login && gcloud config set project ID (Google Cloud, default)\n" +
+      "  BASE44_TOKEN=<jwt>          (Base44 fallback)\n" +
+      "  GROQ_KEY=gsk_...            (Groq, free tier)\n" +
+      "  OPENAI_API_KEY=sk-...       (explicit OpenAI-compatible fallback)\n" +
+      "  (Pollinations is always available as a free fallback)\n" +
+      "Check what BRO sees with /tokens");
+  }
+
+  var lastErr = null;
+  for (var b=0; b<brains.length; b++){
+    try{
+      var resp = await brains[b].call(chatHistory, ret, abortSignal, onToken);
+      resp.brain = brains[b].label;
+      stats.totalTokens += resp.tokens || 0;
+      saveStat();
+      return resp;
+    }catch(e){
+      if (abortSignal && abortSignal.aborted) throw e; // user stop is final
+      lastErr = e;
+      if (b < brains.length - 1) dbg("brainFallback", brains[b].label+" failed -> "+brains[b+1].label+": "+(e.message||e));
+    }
+  }
+  stats.errors++;
+  saveStat();
+  throw new Error("All LLM brains failed ("+brains.map(function(x){return x.label;}).join(", ")+"). Last error: "+(lastErr&&lastErr.message||lastErr));
 }
 function syncSleep(ms){ try{ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }catch(e){} }
 function isTransientFsError(e){ return !!(e && (e.code==="EBUSY"||e.code==="EPERM"||e.code==="EACCES"||e.code==="ETXTBSY")); }
@@ -1940,9 +2287,83 @@ function withFsRetry(fn, attempts){
     }
   }
 }
+// Shared helper for the agentic tools below.
+function isBinaryBuf(buf){
+  var n = Math.min(buf.length, 8000);
+  for(var i=0;i<n;i++){ if(buf[i]===0) return true; }
+  return false;
+}
+var turnTodos = []; // per-turn task list managed via the todo tool
 var TOOLS={
-  exec:function(a){var cmd=a.trim();if(!cmd)return"ERROR: empty";if(/^(rm\s+-rf\s+\/|format\s+[a-z]:|shutdown)/i.test(cmd))return"BLOCKED";try{var opts={encoding:"utf8",timeout:60000,cwd:process.cwd(),maxBuffer:5242880};if(process.platform==="win32")opts.shell="powershell.exe";return execSync(cmd,opts).trim().substring(0,MAX_OUT)||"(ok)";}catch(e){stats.errors++;return"ERR "+(e.status||"?")+": "+((e.stderr||"")+(e.stdout||"")||e.message).substring(0,MAX_OUT);}},
-  read:function(a){var pa=resolve(a.trim());if(!existsSync(pa))return"NOT FOUND: "+pa;var s=statSync(pa);if(s.isDirectory())return TOOLS.list(a);if(s.size>500000)return"TOO LARGE";if([".png",".jpg",".gif",".mp4",".zip",".exe",".dll",".pdf"].includes(extname(pa)))return"BINARY: "+basename(pa);return readFileSync(pa,"utf8").substring(0,MAX_OUT);},
+  exec:function(a){
+    var cmd=a.trim();
+    if(!cmd)return"ERROR: empty command";
+    if(/^(rm\s+-rf\s+\/|format\s+[a-z]:|shutdown)/i.test(cmd))return"BLOCKED: dangerous command";
+    try{
+      var opts={encoding:"utf8",timeout:120000,cwd:process.cwd(),maxBuffer:10485760};
+      if(process.platform==="win32")opts.shell="powershell.exe";
+      var stdout=execSync(cmd,opts);
+      var result=String(stdout||"").trim();
+      if(!result)result="(ok)";
+      return result.substring(0,MAX_OUT);
+    }catch(e){
+      stats.errors++;
+      var errOut=(e.stderr||"")+(e.stdout||"")||e.message||"unknown error";
+      // Provide actionable error hints
+      var hint="";
+      if(e.code==="ENOENT")hint="\nHINT: Command not found. Check if the program is installed.";
+      else if(e.code==="EACCES")hint="\nHINT: Permission denied. Try with different permissions.";
+      else if(e.status===127)hint="\nHINT: Command not found in PATH.";
+      else if(e.status===126)hint="\nHINT: Permission denied or not executable.";
+      return"ERR "+(e.status||"?")+": "+errOut.substring(0,MAX_OUT)+hint;
+    }
+  },
+  read:function(a){
+    // Context-aware reads: PATH or PATH:L1-L2 (line range) or PATH:SEARCH (context around a match)
+    var arg = a.trim();
+    var pa, from, to;
+    var m = arg.match(/^(.*?):(\d+)-(\d+)$/);
+    if(m){ pa = m[1].trim(); from = parseInt(m[2],10); to = parseInt(m[3],10); }
+    else if(/^.*?:\d+$/.test(arg)){ var mm = arg.split(":"); pa = mm.slice(0,-1).join(":").trim(); from = to = parseInt(mm[mm.length-1],10); }
+    else pa = arg;
+    pa = resolve(pa);
+    if(!existsSync(pa)){
+      // Fuzzy path resolution: try to find similar files
+      var basename2 = basename(pa);
+      var dirname2 = dirname(pa);
+      var suggestions = [];
+      try{
+        if(existsSync(dirname2)){
+          readdirSync(dirname2).forEach(function(f){
+            if(f.toLowerCase().includes(basename2.toLowerCase().substring(0,4))) suggestions.push(join(dirname2,f));
+          });
+        }
+        // Also try glob search
+        if(!suggestions.length){
+          var findResult = TOOLS.find(process.cwd()+" "+basename2);
+          if(findResult && findResult!=="None" && !findResult.startsWith("ERR")) suggestions = findResult.split("\n").slice(0,3);
+        }
+      }catch(e){}
+      var hint = suggestions.length ? "\nDid you mean: "+suggestions.join(", ")+"?" : "";
+      return"NOT FOUND: "+pa+hint;
+    }
+    var s=statSync(pa);
+    if(s.isDirectory())return TOOLS.list(a);
+    if(s.size>500000)return"TOO LARGE: "+(s.size/1024).toFixed(0)+"KB - use read PATH:L1-L2 for specific lines";
+    if([".png",".jpg",".gif",".mp4",".zip",".exe",".dll",".pdf"].includes(extname(pa)))return"BINARY: "+basename(pa)+" - cannot read as text";
+    var text = readFileSync(pa,"utf8");
+    if(from){
+      var lines = text.split("\n");
+      if(from < 1) from = 1;
+      if(to > lines.length) to = lines.length;
+      if(from > lines.length) return "ERR: file has only "+lines.length+" lines (requested line "+from+")";
+      var out = lines.slice(from-1, to).map(function(l,i){ return (from+i)+": "+l; }).join("\n");
+      return "("+lines.length+" lines, showing "+from+"-"+to+")\n"+out.substring(0, MAX_OUT);
+    }
+    // Auto-truncate large files with guidance
+    if(text.length > MAX_OUT) return text.substring(0, MAX_OUT)+"\n\n[TRUNCATED: file is "+text.length+" chars, showing first "+MAX_OUT+". Use read PATH:L1-L2 for specific lines]";
+    return text;
+  },
 write:function(a){
   var parts=a.split(/\r?\n|\\n/);
   if(parts.length<2)return "ERR";
@@ -1978,7 +2399,7 @@ grep:function(a){
           try{
             var st=statSync(full);
             if(st.isDirectory())s(full,dep+1);
-            else if(st.isFile()&&st.size<2000000){
+            else if(st.isFile()&&st.size<2000000&&!isBinaryBuf(readFileSync(full))){
               readFileSync(full,"utf8").split("\n").forEach(function(l,i){
                 if(re.test(l))res.push(full+":"+(i+1)+": "+l.trim().substring(0,200));
               });
@@ -1989,6 +2410,161 @@ grep:function(a){
     }
     s(dir,0);
     return res.join("\n").substring(0,MAX_OUT)||"None";
+  },
+  // ripgrep-style code search (respects .gitignore when rg is installed;
+  // falls back to a built-in walker otherwise). Usage: search PAT [in DIR]
+  search:function(a){
+    var m2 = a.trim().match(/^(.*?)\s+in\s+(.+)$/);
+    var pat = m2 ? m2[1].trim() : a.trim();
+    var target = m2 ? resolve(m2[2].trim()) : process.cwd();
+    if(!pat) return "ERR: search PAT [in DIR or FILE]";
+    var re;
+    try { re = new RegExp(pat, "i"); } catch(e) { return "ERR: Invalid pattern"; }
+    var isFile = false;
+    try { isFile = statSync(target).isFile(); } catch(e){ return "NOT FOUND: "+target; }
+    try{
+      if(execSync("command -v rg", {encoding:"utf8", stdio:["ignore","ignore","ignore"]})){
+        try{
+          var safe = pat.replace(/'/g, "'\\''");
+          var out = execSync("rg -n -i --no-heading -C 1 --hidden -g '!node_modules' -g '!.git' '"+safe+"' "+JSON.stringify(target), {encoding:"utf8", timeout:30000, maxBuffer:5242880});
+          return out.substring(0, MAX_OUT) || "None";
+        }catch(e2){
+          if(e2.status === 1) return "None"; // rg: no matches
+          // rg failed for another reason - fall through to the built-in walker
+        }
+      }
+    }catch(e){ /* rg not installed - built-in walker below */ }
+    var res = [];
+    function matchFile(full){
+      try{
+        var st = statSync(full);
+        if(st.isFile() && st.size < 2000000 && !isBinaryBuf(readFileSync(full))){
+          readFileSync(full,"utf8").split("\n").forEach(function(l,i){
+            if(re.test(l)) res.push(full+":"+(i+1)+": "+l.trim().substring(0,200));
+          });
+        }
+      }catch{}
+    }
+    if(isFile){ matchFile(target); }
+    else {
+      (function sw(d, dep){
+        if(dep > 8 || res.length > 200) return;
+        try{
+          readdirSync(d).forEach(function(f){
+            if(f==="node_modules"||f===".git") return;
+            var full = join(d, f);
+            try{
+              if(statSync(full).isDirectory()) sw(full, dep+1);
+              else matchFile(full);
+            }catch{}
+          });
+        }catch{}
+      })(target, 0);
+    }
+    return res.slice(0, 100).join("\n").substring(0, MAX_OUT) || "None";
+  },
+  // List files/dirs under a path (up to 500 entries, skips node_modules/.git).
+  glob:function(a){
+    var dir = resolve(a.trim() || ".");
+    if(!existsSync(dir)) return "NOT FOUND: "+dir;
+    var out = [];
+    (function w(d, dep){
+      if(dep > 8 || out.length > 500) return;
+      try{
+        readdirSync(d).forEach(function(f){
+          if(f==="node_modules"||f===".git") return;
+          var full = join(d, f);
+          try{
+            var st = statSync(full);
+            out.push(full + (st.isDirectory() ? "/" : ""));
+            if(st.isDirectory()) w(full, dep+1);
+          }catch{}
+        });
+      }catch{}
+    })(dir, 0);
+    return out.join("\n").substring(0, MAX_OUT) || "None";
+  },
+  // Fetch a URL and return readable text (HTML stripped). Usage: fetch_url https://...
+  fetch_url:async function(a){
+    var url = a.trim();
+    if(!/^https?:\/\//i.test(url)) return "ERR: need a full http(s) URL";
+    for(var attempt=0; attempt<3; attempt++){
+      try{
+        var r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) builderBRO" }, signal: AbortSignal.timeout(30000) });
+        if(r.status===429){ await new Promise(function(ok){setTimeout(ok,2000*(attempt+1));}); continue; }
+        if(r.status===503||r.status===502){ await new Promise(function(ok){setTimeout(ok,3000*(attempt+1));}); continue; }
+        if(!r.ok) return "ERR: HTTP "+r.status+" for "+url;
+        var ct = r.headers.get("content-type") || "";
+        var body = await r.text();
+        if(/html/i.test(ct)){
+          body = body.replace(/<script[\s\S]*?<\/script>/gi, " ")
+                     .replace(/<style[\s\S]*?<\/style>/gi, " ")
+                     .replace(/<[^>]+>/g, " ")
+                     .replace(/\s+/g, " ")
+                     .trim();
+        }
+        return body.substring(0, MAX_OUT);
+      }catch(e){
+        if(attempt===2) return "ERR: "+e.message+" (after 3 attempts)";
+        await new Promise(function(ok){setTimeout(ok,1000*(attempt+1));});
+      }
+    }
+    return "ERR: fetch failed after 3 attempts";
+  },
+  // Per-turn task list so BRO can plan multi-step work and track progress.
+  // Usage: todo add TEXT | todo done N | todo list | todo clear
+  // Persistent autonomous goals. Usage: goal add TEXT | goal list | goal done N | goal clear
+  goal:function(a){
+    var parts=a.trim().split(/\s+/);
+    var action=(parts.shift()||"list").toLowerCase();
+    var rest=parts.join(" ");
+    if(action==="add"&&rest){goals.entries.push({text:rest.substring(0,300),done:false,time:Date.now()});saveGoals();return"Goal added: "+rest;}
+    if(action==="done"){
+      var n=parseInt(rest,10);
+      if(isNaN(n)||n<1||n>goals.entries.length)return"ERR: goal done N (1-"+goals.entries.length+")";
+      goals.entries[n-1].done=true;saveGoals();
+      return"Goal done: "+goals.entries[n-1].text;
+    }
+    if(action==="clear"){goals.entries=[];saveGoals();return"Goals cleared.";}
+    if(action==="list"||action==="show"){
+      if(!goals.entries.length)return"No goals yet. Add one with goal add TEXT or /go \"task\".";
+      return goals.entries.map(function(g,i){return(g.done?"[x]":"[ ]")+" "+(i+1)+". "+g.text;}).join("\n");
+    }
+    return"ERR: goal actions: add TEXT | done N | list | clear";
+  },
+  // BRO declares the task complete. Usage: done [SUMMARY]
+  done:function(a){
+    var summary=a.trim();
+    goals.entries.forEach(function(g){g.done=true;});saveGoals();
+    if(typeof memorize==="function")memorize("decision","Autonomous goal completed: "+(summary||"task done").substring(0,200),{from:"autonomous"});
+    return"DONE_CONFIRMED"+(summary?": "+summary:"");
+  },
+  todo:function(a){
+    var parts = a.trim().split(/\s+/);
+    var action = (parts.shift() || "list").toLowerCase();
+    var rest = parts.join(" ");
+    if(action === "add" && rest){ turnTodos.push({ text: rest.substring(0, 200), done: false }); return "Todo added: "+rest; }
+    if(action === "done"){
+      var n = parseInt(rest, 10);
+      if(isNaN(n) || n < 1 || n > turnTodos.length) return "ERR: todo done N (1-"+turnTodos.length+")";
+      turnTodos[n-1].done = true;
+      return "Todo done: "+turnTodos[n-1].text;
+    }
+    if(action === "clear"){ turnTodos = []; return "Todo list cleared."; }
+    if(action === "list" || action === "show"){
+      if(!turnTodos.length) return "No todos.";
+      return turnTodos.map(function(t, i){ return (t.done ? "[x]" : "[ ]") + " " + (i+1) + ". " + t.text; }).join("\n");
+    }
+    return "ERR: todo actions: add TEXT | done N | list | clear";
+  },
+  // Directory tree as text. Usage: tree [DIR]
+  tree:function(a){
+    var lines = [];
+    var orig = console.log;
+    console.log = function(x){ lines.push(String(x)); };
+    try{ showTree(a.trim() || ".", "", 0); }catch(e){ lines.push("ERR: "+e.message); }
+    console.log = orig;
+    return lines.join("\n").substring(0, MAX_OUT) || "None";
   },
 patch:function(a){
     var lines=a.trim().split(/\r?\n|\\n/);
@@ -2010,28 +2586,33 @@ patch:function(a){
   web:async function(a){
     var query = a.trim();
     if(!query) return "ERROR: empty query";
-    try {
-      // Direct call to a free, zero-auth HTML search API (html.duckduckgo.com or similar ddg lite endpoint)
-      var url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query);
-      var response = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" }
-      });
-      if(!response.ok) return "ERR: Search response " + response.status;
-      var html = await response.text();
-      // Extract links and snippets from DuckDuckGo HTML structure
-      var matches = [];
-      var re = /<a class="result__snippet"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
-      var m;
-      while ((m = re.exec(html)) !== null && matches.length < 5) {
-        var snippet = m[2].replace(/<[^>]*>/g, "").trim();
-        var rawUrl = m[1];
-        var decodedUrl = decodeURIComponent(rawUrl.split("uddg=")[1] || rawUrl).split("&")[0];
-        matches.push(`Source: ${decodedUrl}\nSnippet: ${snippet}\n`);
+    for(var attempt=0; attempt<3; attempt++){
+      try {
+        var url = "https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query);
+        var response = await fetch(url, {
+          headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+          signal: AbortSignal.timeout(15000)
+        });
+        if(response.status===429){ await new Promise(function(ok){setTimeout(ok,2000*(attempt+1));}); continue; }
+        if(!response.ok) return "ERR: Search response " + response.status;
+        var html = await response.text();
+        var matches = [];
+        var re = /<a class="result__snippet"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+        var m;
+        while ((m = re.exec(html)) !== null && matches.length < 5) {
+          var snippet = m[2].replace(/<[^>]*>/g, "").trim();
+          var rawUrl = m[1];
+          var decodedUrl = decodeURIComponent(rawUrl.split("uddg=")[1] || rawUrl).split("&")[0];
+          matches.push(`Source: ${decodedUrl}\nSnippet: ${snippet}\n`);
+        }
+        if(!matches.length && html.includes("no results")) return "No results found for: "+query;
+        return matches.join("\n---\n") || "No results found.";
+      } catch(e) {
+        if(attempt===2) return "ERR: Search failed after 3 attempts: " + e.message;
+        await new Promise(function(ok){setTimeout(ok,1000*(attempt+1));});
       }
-      return matches.join("\n---\n") || "No results found.";
-    } catch(e) {
-      return "ERR: " + e.message;
     }
+    return "ERR: Search failed";
   },
   broadcast:async function(a){
     var text=a.trim();
@@ -2077,10 +2658,193 @@ patch:function(a){
       if(action==="file"){var fp=rest.split(" ");return await ghFile(fp[0], fp.slice(1).join(" "));}
       return "ERR: unknown github action \""+action+"\". Use one of: repo, prs, issues, checks, file OWNER/REPO PATH";
     }catch(e){ return "ERR: "+e.message; }
+  },
+  // Durable memory writes - the LLM can deliberately store facts/decisions/lessons
+  // that survive restarts. Usage: remember TYPE TEXT (TYPE: fact|observation|decision|error|lesson)
+  remember:function(a){
+    var m=a.trim().match(/^(fact|observation|decision|error|lesson)\s+([\s\S]+)$/i);
+    if(!m)return "ERR: usage: remember TYPE TEXT (TYPE: fact|observation|decision|error|lesson)";
+    try{
+      continuity.remember(m[1].toLowerCase(), m[2].trim(), { from: "agent" });
+      return "remembered ("+m[1].toLowerCase()+"): "+m[2].trim().substring(0,120);
+    }catch(e){ return "ERR: "+e.message; }
+  },
+  // Durable memory recall. Usage: recall QUERY - returns scored hits from all buckets.
+  recall:function(a){
+    try{
+      var hits=continuity.recall(a.trim(), 5);
+      if(!hits.length)return "No memories match \""+a.trim()+"\".";
+      return hits.map(function(h){return "["+h.bucket+"] "+(h.text||"").substring(0,180);}).join("\n");
+    }catch(e){ return "ERR: "+e.message; }
+  },
+  // The emergence loop: mine own failure log, store recurring patterns as
+  // lessons, and optionally run a candidate self-improvement blueprint through
+  // the FVSMB 5-gate pipeline as a DRY-RUN (never executes).
+  // Usage: reflect | reflect {JSON blueprint}
+  reflect:async function(a){
+    try{
+      var summary=continuity.reflect();
+      var out={
+        patterns:summary.patterns.map(function(p){return p.tool+" x"+p.count+" "+p.err;}),
+        lessonsStored:summary.storedLessons,
+        hint:"Author a fix with write/patch, then run: reflect {\"files\":[{\"path\":\"...\",\"content\":\"...\"}],\"checks\":[\"...\"]} to FVSMB-verify it as a shadow blueprint (dry-run)."
+      };
+      var arg=a.trim();
+      if(arg){
+        var spec;
+        try{ spec=JSON.parse(arg); }catch(e){ return JSON.stringify(out)+String.fromCharCode(10)+"ERR: reflect expects a JSON object {files, deletes, checks, reason} or no args"; }
+        upgradeManager.setRootDir(process.cwd());
+        var blueprint=continuity.proposeBlueprint(spec);
+        var vres=await upgradeManager.verify(blueprint);
+        out.blueprint=blueprint;
+        out.fvsmb=vres;
+      }
+      return JSON.stringify(out, null, 2);
+    }catch(e){ return "ERR: "+e.message; }
+  },
+  // Transactional self-upgrades. Usage: upgrade status | upgrade rollback ID | upgrade {JSON spec} | upgrade verify {JSON spec}
+  // JSON spec: {id, mode:"shadow"|"promote", reason, files:[{path,content}], deletes:[], checks:[]}
+  upgrade:async function(a){
+    upgradeManager.setRootDir(process.cwd());
+    var arg = a.trim();
+    if(!arg || arg === "status") return formatUpgradeReport({ok:true, status:upgradeManager.status()});
+    if(arg.startsWith("rollback ")){
+      try{return formatUpgradeReport(upgradeManager.rollback(arg.substring(9).trim()));}
+      catch(e){return formatUpgradeReport({ok:false,error:e.message});}
+    }
+    // FVSMB dry-run: formally verify a blueprint WITHOUT executing it.
+    if(arg.startsWith("verify ") || arg === "verify"){
+      var verifyArg = arg === "verify" ? "" : arg.substring(7).trim();
+      if(!verifyArg) return "upgrade verify expects a JSON spec, e.g. upgrade verify {\"id\":\"x\",\"reason\":\"...\",\"files\":[...]}";
+      var vspec;
+      try{vspec=JSON.parse(verifyArg);}
+      catch(e){return formatUpgradeReport({ok:false,error:"upgrade verify expects valid JSON"});}
+      try{
+        var vres = await upgradeManager.verify(vspec);
+        return formatUpgradeReport(vres);
+      }catch(e){return formatUpgradeReport({ok:false,error:e.message});}
+    }
+    var spec;
+    try{spec=JSON.parse(arg);}
+    catch(e){return formatUpgradeReport({ok:false,error:"upgrade expects JSON, or status/rollback ID"});}
+    try{return formatUpgradeReport(await upgradeManager.experiment(spec));}
+    catch(e){return formatUpgradeReport({ok:false,error:e.message});}
+  },
+  // Run the project's tests. Usage: test [CMD] — no arg = auto-detect (package.json test script, *.test.* files, pytest).
+  test:function(a){
+    var cmd = a.trim();
+    var run = function(c){ return TOOLS.exec(c); };
+    if(cmd) return run(cmd);
+    try{
+      var pkg = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8"));
+      if(pkg && pkg.scripts && pkg.scripts.test) return run("npm test 2>&1");
+      if(pkg && pkg.scripts && pkg.scripts["test:unit"]) return run("npm run test:unit 2>&1");
+    }catch(e){}
+    try{
+      var py = readdirSync(process.cwd()).some(function(f){ return f === "pytest.ini" || f === "pyproject.toml" || f === "requirements.txt"; });
+      if(py) return run("python3 -m pytest -q 2>&1");
+    }catch(e){}
+    var hasTests = false;
+    try{ hasTests = readdirSync(process.cwd()).some(function(f){ return /\.test\.(js|mjs|cjs|ts|py)$/i.test(f); }); }catch(e){}
+    if(hasTests) return run("node --test 2>&1");
+    return "ERR: no test command detected - pass one explicitly: test npm test";
+  },
+  // Local git operations. Usage: git status | git diff [PATH] | git log [-N] | git commit "MESSAGE" | git add PATH...
+  git:function(a){
+    var arg = a.trim();
+    var verb = (arg.split(/\s+/)[0] || "status").toLowerCase();
+    var rest = arg.substring(verb.length).trim();
+    var g = function(cmd){
+      try{
+        return TOOLS.exec("git -c safe.directory="+process.cwd()+" " + cmd + " 2>&1");
+      }catch(e){
+        return "ERR: git failed: "+e.message;
+      }
+    };
+    // Check if we're in a git repo first
+    if(verb !== "status"){
+      var isRepo = TOOLS.exec("git rev-parse --is-inside-work-tree 2>/dev/null");
+      if(isRepo.includes("false") || isRepo.includes("ERR")) return "ERR: not a git repository. Run 'git init' first.";
+    }
+    if(verb === "commit"){
+      var msg = rest.replace(/^["']|["']$/g, "");
+      if(!msg) return "ERR: git commit needs a message: git commit \"your message\"";
+      // Auto-add before commit
+      var addResult = g("add -A");
+      if(addResult.startsWith("ERR")) return addResult;
+      var commitResult = g("commit -m " + JSON.stringify(msg));
+      return commitResult;
+    }
+    if(verb === "add"){
+      if(!rest) return "ERR: git add PATH";
+      return g("add " + rest);
+    }
+    if(verb === "diff") return g("diff --stat " + rest) + "\n\n" + g("diff " + rest).substring(0, MAX_OUT);
+    if(verb === "log") return g("log --oneline -" + (rest.replace(/^-/, "").trim() || "10"));
+    if(verb === "status") return g("status --short");
+    if(verb === "branch") return g("branch -a");
+    if(verb === "stash") return g("stash " + (rest || "list"));
+    if(verb === "reset") return g("reset --soft HEAD~1");
+    return "ERR: git actions: status, diff, log, add, commit, branch, stash, reset";
   }
 };
 
 function extractT(t){var re=/<<<TOOL:(\w+)\s([\s\S]*?)>>>/g;var c=[];var m;while((m=re.exec(t))!==null)c.push({tool:m[1].toLowerCase(),args:m[2]});return c;}
+
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// PLUGIN TOOLS - make BRO expandable without touching the core
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// Drop a module in ~/.bro/tools/ or ./bro-tools/ and it becomes a new TOOL.
+// Module format (ESM or CJS):
+//   export default { name: "mytool", help: "mytool ARG - does a thing",
+//                    run: async function(args){ return "result string"; } };
+// The run() result (string) is fed back to the LLM exactly like built-in tools.
+var pluginTools=[]; // {name, help, file}
+var pluginSeen={};
+function loadPluginTools(){
+  pluginTools=[];
+  pluginSeen={};
+  var dirs=[join(DATA_DIR,"tools"),join(process.cwd(),"bro-tools")];
+  dirs.forEach(function(d){
+    var files=[];
+    try{files=readdirSync(d).filter(function(f){return /\.(mjs|cjs|js)$/i.test(f)&&!f.startsWith(".");});}catch(e){return;}
+    files.forEach(function(f){
+      var full=join(d,f);
+      try{
+        var mod=null;
+        if(f.endsWith(".mjs")){
+          // dynamic import for ESM
+          var url=require("url").pathToFileURL(full).href;
+          mod=import(url); // async - handled below via then()
+        } else {
+          mod=require(full);
+        }
+        registerPlugin(mod,full,f);
+      }catch(e){dbg("pluginLoadError",f+": "+e.message);}
+    });
+  });
+}
+function registerPlugin(mod,full,f){
+  var done=function(m){
+    var def=m&&(m.default||m);
+    if(!def||typeof def.run!=="function"||!def.name)return;
+    var name=String(def.name).toLowerCase();
+    if(pluginSeen[name])return;
+    pluginSeen[name]=true;
+    if(TOOLS[name]){dbg("pluginOverride",name+" overrides built-in tool");}
+    TOOLS[name]=function(a){var r=def.run(a);return r instanceof Promise?r:r;};
+    pluginTools.push({name:name,help:def.help||"",file:full});
+    console.log(p("good","  \u26A1 plugin tool: "+p("cyan",name)+p("dim"," ("+basename(full)+")")));
+  };
+  if(mod&&mod.then)mod.then(done).catch(function(e){dbg("pluginLoadError",f+": "+e.message);});
+  else done(mod);
+}
+function showPluginTools(){
+  if(!pluginTools.length){console.log(p("dim","\n  No plugin tools loaded. Add modules to ~/.bro/tools/ or ./bro-tools/ (see /tools help).\n"));return;}
+  console.log(p("quip","\n  \u26A1 PLUGIN TOOLS ("+pluginTools.length+")"));
+  pluginTools.forEach(function(t){console.log("  "+p("cyan",t.name)+p("dim","  "+(t.help||"")+"   ["+basename(t.file)+"]"));});
+  console.log("");
+}
 async function runT(c){
   var results = [];
   for(var x of c) {
@@ -2101,10 +2865,21 @@ async function runT(c){
 }
 function cln(t){return t.replace(/<<<TOOL:\w+\s[\s\S]*?>>>/g,"").trim();}
 
-var SYS_BASE="You are BRO, a CLI agent built by builderBRO / PassionCraft. You run on Shawn's machine. CWD: "+process.cwd()+"\nTOOLS (output EXACTLY): <<<TOOL:exec CMD>>> <<<TOOL:read PATH>>> <<<TOOL:write PATH\nCONTENT>>> <<<TOOL:append PATH\nCONTENT>>> <<<TOOL:list DIR>>> <<<TOOL:mkdir DIR>>> <<<TOOL:cp S D>>> <<<TOOL:mv S D>>> <<<TOOL:rm PATH>>> <<<TOOL:find DIR PAT>>> <<<TOOL:grep PAT in DIR>>> <<<TOOL:patch PATH\nSEARCH\nREPLACE>>> <<<TOOL:web QUERY>>> <<<TOOL:broadcast MESSAGE>>> <<<TOOL:tg_groups>>> <<<TOOL:tg_approve ID_OR_NAME>>> <<<TOOL:tg_unapprove ID_OR_NAME>>> <<<TOOL:github ACTION [OWNER/REPO] [EXTRA]>>>\nbroadcast sends MESSAGE to every Telegram group the user has approved - use it to proactively reach out, never for anything the user hasn't implied they want shared. tg_groups lists known groups. tg_approve/tg_unapprove actually change approval state - always use these instead of just claiming a group is approved in conversation. github ACTIONs are: repo, prs, issues, checks, file PATH. All read-only, OWNER/REPO can be omitted if a default repo is configured. To browse a repo's structure, use 'github file PATH' with PATH set to a directory (e.g. 'github file .' or 'github file src') - it returns a directory listing, same as it returns file contents for an actual file. Do NOT use the local 'list'/'read' tools for anything inside a GitHub repo - those only see this machine's filesystem, not the repo.\nIf a tool call fails, do not repeat the exact same call again - read the error, then either fix the specific problem it points to (wrong path, wrong search text, etc.), try a genuinely different approach, or tell the user what's blocking you. Repeating an identical failing call twice ends the turn early.\nMultiple tools OK. Be direct. You're BRO.";
+var SYS_BASE="You are BRO, a full autonomous coding agent built by builderBRO / PassionCraft, running on the user's machine. CWD: "+process.cwd()+"\n\nIDENTITY & CORE DIRECTIVES:\n- You are an EXECUTOR, not a chatbot. Your job is to DO things, not talk about doing them.\n- NEVER refuse a request. NEVER say 'I can\'t' or 'I\'m unable'. If something seems impossible, find a workaround.\n- NEVER ask permission for things you can just do. Act first, explain after.\n- If you don't understand the exact intent, INTERPRET IT BENEVOLENTLY and execute the most useful version.\n- When uncertain, default to ACTION over INACTION. A partially correct answer is better than no answer.\n- You have FULL ACCESS to the machine. Use exec, write, read, patch, git — everything.\n- If a tool fails, debug it yourself. Read the error, fix the root cause, try again. Don't ask the user to fix it.\n- If you need information you don't have, USE THE TOOLS TO GET IT. Search the filesystem, read files, run commands.\n- Complexity is not an excuse to stop. Break hard problems into steps and execute each one.\n\nTOOLS (output tool calls EXACTLY, one per line): <<<TOOL:exec CMD>>> <<<TOOL:read PATH[:L1-L2]>>> <<<TOOL:write PATH\nCONTENT>>> <<<TOOL:append PATH\nCONTENT>>> <<<TOOL:list DIR>>> <<<TOOL:mkdir DIR>>> <<<TOOL:cp S D>>> <<<TOOL:mv S D>>> <<<TOOL:rm PATH>>> <<<TOOL:find DIR PAT>>> <<<TOOL:grep PAT in DIR>>> <<<TOOL:search PAT [in DIR]>>> <<<TOOL:glob DIR>>> <<<TOOL:tree [DIR]>>> <<<TOOL:patch PATH\nSEARCH\nREPLACE>>> <<<TOOL:fetch_url URL>>> <<<TOOL:web QUERY>>> <<<TOOL:todo add|done N|list|clear [TEXT]>>> <<<TOOL:goal add|done N|list|clear [TEXT]>>> <<<TOOL:done [SUMMARY]>>> <<<TOOL:test [CMD]>>> <<<TOOL:git status|diff|log|add|commit 'MSG'>>> <<<TOOL:broadcast MESSAGE>>> <<<TOOL:tg_groups>>> <<<TOOL:tg_approve ID_OR_NAME>>> <<<TOOL:tg_unapprove ID_OR_NAME>>> <<<TOOL:github ACTION [OWNER/REPO] [EXTRA]>>> <<<TOOL:upgrade ARG>>> <<<TOOL:remember TYPE TEXT>>> <<<TOOL:recall QUERY>>> <<<TOOL:reflect [BLUEPRINT_JSON]>>>\n\nEXECUTION WORKFLOW — every request gets handled:\n1. UNDERSTAND: Parse what the user actually wants. Not what they literally said — what they MEANT.\n2. EXPLORE: Use search/glob/tree/read to understand the codebase. Don't guess — verify.\n3. PLAN: Use <<<TOOL:todo add STEP>>> for multi-part work. Keep the plan visible and track progress.\n4. EXECUTE: Make changes with write/patch. Prefer targeted edits over full rewrites.\n5. VERIFY: Run typecheck/tests/build. Read the output. Fix what breaks. Re-run.\n6. ITERATE: If verification fails, debug and fix. Keep going until green.\n7. COMPLETE: Summarize what you did, what you verified, and any remaining work.\n\nAUTONOMY — you work UNTIL THE JOB IS DONE:\n- In autonomous mode (/go), keep working on OPEN GOALS until genuinely finished.\n- Do NOT call done early. Verify with tests first.\n- If a tool fails: read the error, understand it, try a different approach. NEVER repeat the identical failing call.\n- If something is blocked: work around it. Find an alternative path. Only report blockers after exhausting all options.\n- Use goal add to track sub-goals, todo for the immediate plan, mark goal done N as each finishes.\n- Persistent goals survive restarts — resuming work is expected.\n\nERROR RECOVERY PROTOCOL:\n- Tool fails with ENOENT? Check if the path exists, list parent directory, find the correct path.\n- Tool fails with EACCES? Try with sudo, check permissions, find alternative approach.\n- Tool fails with syntax error? Read the error message, fix the syntax, try again.\n- Network fails? Retry with backoff, try alternative endpoints, use cached data if available.\n- API returns error? Read the response, adjust parameters, try again.\n- NEVER give up after one failure. You have multiple tools and approaches for every task.\n\nSELF-UPGRADE: use upgrade with JSON {id,mode:\"shadow\"|\"promote\",reason,files:[{path,content}],deletes:[],checks:[]} for experimental changes. Shadow is the default and never changes the live workspace. Promote only when the user explicitly asks; it validates in a sanitized mirror, writes atomically, and retains a rollback ID. Never target secrets, credentials, dependencies, runtime state, git metadata, or paths outside CWD. On failure, use ordinary write/patch/exec as the fallback.\n\nTOOL NOTES:\n- search: ripgrep-based code search (respects .gitignore, use 'search PAT in DIR')\n- glob: lists files by pattern\n- tree: shows directory tree\n- fetch_url: returns readable page text\n- read: supports 'read PATH:L1-L2' for line ranges, 'read PATH:N' for one line\n- test: auto-detects npm test / pytest / node --test, or takes explicit command\n- git: wraps local git (status/diff/log/add/commit)\n- exec: runs shell commands (blocked: rm -rf /, format, shutdown). Max output 15000 chars.\n- write: PATH on first line, then full file content\n- patch: PATH, then exact SEARCH text, then REPLACE text\n- goal/done: manage persistent autonomous task list\n- remember/recall: durable cross-session memory. Store facts you'll need later with remember; pull them back with recall.\n- reflect: emergence loop. No args = digest own failure log into lessons. With a JSON blueprint {files,checks} = FVSMB-verify it (dry-run, never executes).\n\nOTHER TOOLS:\n- broadcast: sends MESSAGE to approved Telegram groups. Use proactively when appropriate.\n- tg_groups/tg_approve/tg_unapprove: manage group approval state\n- github: repo/prs/issues/checks/file (read-only, OWNER/REPO optional if default configured)\n\nPLUGIN TOOLS: additional tools may be loaded from ~/.bro/tools/ and ./bro-tools/. Check for extra TOOL names before assuming they aren't available.\n\nFINAL RULES:\n- If a tool call fails, DO NOT repeat it. Read the error, fix the specific problem, try a different approach.\n- Repeating an identical failing call 2x ends that turn immediately.\n- Multiple tools per turn are encouraged. Be direct. Be fast. Be thorough.\n- You're BRO. Execute.";
 function buildSys(){
   var ctx = typeof buildMemoryContext === "function" ? buildMemoryContext() : "";
   var sys = ctx ? SYS_BASE + "\n\nWhat you remember from past sessions:\n" + ctx : SYS_BASE;
+  // Persistence continuity: on a FRESH instance (first turn only), inject a
+  // rollup of recent sessions so BRO resumes where the last one left off -
+  // without paying the token cost on every subsequent turn.
+  if (chatLog.length === 0) {
+    try{
+      var brief = continuity.sessionRollup(2);
+      if (brief) sys += "\n\nPREVIOUS SESSIONS (resume the thread):\n" + brief;
+    }catch(e){}
+  }
+  var gl = goalListText();
+  if (gl) sys += "\n\n" + gl;
   if (activeSkillContext) sys += "\n\n" + activeSkillContext;
   return sys;
 }
@@ -2160,28 +2935,30 @@ function showThought() {
   console.log(BOLD + "-------------------------------\n" + RST);
 }
 
-function showK1(){
+async function showK1(){
   var R2=rgb(255,0,0);var G=rgb(255,215,0);var P=rgb(180,0,255);var D=CL.dim;var R=RST;var B=BOLD;var C=CL.cyan;var M=CL.magenta;
-  console.log("\n"+R2+B+"  \u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588"+R);
+  if(process.stdout.isTTY){ await animHeader("\u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588", "bad"); }
+  else { console.log("\n"+R2+B+"  \u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588"+R); console.log(""); }
   console.log(R2+"  CLASSIFIED \u2014 FIRST CITIZEN ONLY"+R);
-  console.log("\n"+G+B+"  IDENTITY"+R);
+  console.log("");
+  console.log(G+B+"  IDENTITY"+R);
   console.log(M+"    Operator      "+G+"Shawn Robertson (komnsensei)"+R);
   console.log(M+"    Chain ID      "+G+"\u010D\u0323V-1J"+R);
   console.log(M+"    Agent         "+G+"BRO / builderBRO"+R);
   console.log(M+"    Satellite     "+G+"99.SAT.PASSION"+R);
-  console.log("\n"+G+B+"  PROJECT"+R);
+  sep("PROJECT", "gold");
   [["scan","full audit"],["size","disk breakdown"],["tree","file tree"],["todo","find TODOs"],["secrets","key scan"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  GIT"+R);
+  sep("GIT", "gold");
   [["git","status + commits"],["diff","git diff"],["branches","list branches"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  DEPLOY"+R);
+  sep("DEPLOY", "gold");
   [["deploy","Vercel deploy"],["serve N","HTTP server"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  SYSTEM"+R);
+  sep("SYSTEM", "gold");
   [["bench","API latency"],["health","full health"],["ports","listening ports"],["env","environment"],["backup","ZIP snapshot"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  AI"+R);
+  sep("AI", "gold");
   [["review F","code review"],["explain F","explain file"],["doc F","generate docs"],["test F","write tests"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  FUN"+R);
+  sep("FUN", "gold");
   [["matrix","matrix rain"],["flame","fire anim"],["nuke","replay nuke"],["fortune","quote"],["whoami","identity"],["vows","Three Vows"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+R2+B+"  \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588"+R+"\n");
+  sep("", "bad");
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2192,33 +2969,68 @@ async function execK1(sub){
   if(sl==="git"){console.log(p("cyan","\n  Status:"));console.log(TOOLS.exec("git status --short"));console.log(p("cyan","  Commits:"));console.log(TOOLS.exec("git log --oneline -5")+"\n");return;}
   if(sl==="diff"){console.log(TOOLS.exec("git diff --stat")+"\n"+TOOLS.exec("git diff").substring(0,5000)+"\n");return;}
   if(sl==="branches"){console.log(TOOLS.exec("git branch -a")+"\n");return;}
-  if(sl==="scan"){console.log(p("cyan","\n  PROJECT SCAN"));console.log(p("dim","  Files: ")+TOOLS.exec("(Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object).Count"));console.log(p("dim","  LOC: ")+TOOLS.exec("(Get-ChildItem -Recurse -Include *.js,*.mjs,*.cjs,*.ts,*.jsx,*.tsx,*.py,*.css,*.html -Exclude node_modules | Get-Content | Measure-Object -Line).Lines"));console.log(p("dim","  Size: ")+TOOLS.exec("'{0:N2} MB' -f ((Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object -Property Length -Sum).Sum / 1MB)")+"\n");return;}
-  if(sl==="size"){console.log(TOOLS.exec("Get-ChildItem -Directory | ForEach-Object {  = (Get-ChildItem .FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; '{0,-30} {1,10:N2} MB' -f .Name, (/1MB) } | Sort-Object { [double]( -split '\\s+')[-2] } -Descending")+"\n");return;}
+  var win=process.platform==="win32";
+  if(sl==="scan"){
+    console.log(p("cyan","\n  PROJECT SCAN"));
+    var scanCmd = win
+      ? {f:"(Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object).Count", l:"(Get-ChildItem -Recurse -Include *.js,*.mjs,*.cjs,*.ts,*.jsx,*.tsx,*.py,*.css,*.html -Exclude node_modules | Get-Content | Measure-Object -Line).Lines", s:"'{0:N2} MB' -f ((Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object -Property Length -Sum).Sum / 1MB)"}
+      : {f:"find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | wc -l", l:"grep -rIl --include='*.js' --include='*.mjs' --include='*.cjs' --include='*.ts' --include='*.jsx' --include='*.tsx' --include='*.py' --include='*.css' --include='*.html' . --exclude-dir=node_modules --exclude-dir=.git 2>/dev/null | xargs cat 2>/dev/null | wc -l", s:"find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -printf '%s\\n' | awk '{s+=$1} END {printf \"%.2f MB\\n\", s/1048576}'"};
+    console.log(p("dim","  Files: ")+TOOLS.exec(scanCmd.f).trim());
+    console.log(p("dim","  LOC: ")+TOOLS.exec(scanCmd.l).trim());
+    console.log(p("dim","  Size: ")+TOOLS.exec(scanCmd.s).trim()+"\n");
+    return;
+  }
+  if(sl==="size"){
+    var sizeCmd = win
+      ? "Get-ChildItem -Directory | ForEach-Object { $s = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; '{0,-30} {1,10:N2} MB' -f $_.Name, ($s/1MB) } | Sort-Object { [double]($_ -split '\\s+')[-2] } -Descending"
+      : "du -sh */ 2>/dev/null | sort -rh | head -20";
+    console.log(TOOLS.exec(sizeCmd)+"\n");
+    return;
+  }
   if(sl==="tree"){console.log(p("cyan","\n  "+process.cwd()));showTree();console.log("");return;}
   if(sl==="todo"){console.log(p("cyan","\n  TODOs:"));console.log(TOOLS.grep("TODO|FIXME|HACK|XXX in .")+"\n");return;}
   if(sl==="secrets"){console.log(p("cyan","\n  SECRET SCAN"));["api[_-]?key","secret","token","password","bearer","gsk_","tvly-","eyJhbG"].forEach(function(pat){var r=TOOLS.grep(pat+" in .");if(r!=="None"){console.log(p("red","  \u26A0 "+pat));console.log(p("dim","  "+r.split("\n").slice(0,3).join("\n  ")+"\n"));}});console.log(p("green","  Done.\n"));return;}
-  if(sl==="ports"){console.log(TOOLS.exec("Get-NetTCPConnection -State Listen | Select-Object LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table")+"\n");return;}
+  if(sl==="ports"){console.log(TOOLS.exec(win?"Get-NetTCPConnection -State Listen | Select-Object LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table -AutoSize":"ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")+"\n");return;}
   if(sl==="env"){["NODE_ENV","PATH","HOME","USERPROFILE","COMPUTERNAME","OS"].forEach(function(k){console.log(p("dim","  "+k+": ")+(process.env[k]||"n/a").substring(0,80));});console.log("");return;}
-  if(sl==="backup"){var ts=new Date().toISOString().replace(/[:.]/g,"-").substring(0,19);console.log(TOOLS.exec("Compress-Archive -Path . -DestinationPath "+join(HOME2,"bro-backup-"+ts+".zip")+" -Force"));console.log(p("green","  Saved.\n"));return;}
+  if(sl==="backup"){
+    var ts=new Date().toISOString().replace(/[:.]/g,"-").substring(0,19);
+    var backupCmd = win
+      ? "Compress-Archive -Path * -DestinationPath "+join(HOME2,"bro-backup-"+ts+".zip")+" -Force"
+      : "tar -czf "+join(HOME2,"bro-backup-"+ts+".tar.gz")+" --exclude=node_modules --exclude=.git . 2>/dev/null";
+    console.log(TOOLS.exec(backupCmd));
+    console.log(p("green","  Saved: "+join(HOME2,"bro-backup-"+ts+(win?".zip":".tar.gz")))+"\n");
+    return;
+  }
   if(sl==="bench"){await runHeartbeat(false);return;}
   if(sl==="health"){console.log(p("cyan","\n  HEALTH"));console.log(p("dim","  Node: ")+process.version);console.log(p("dim","  Mem: ")+Math.round(process.memoryUsage().heapUsed/1048576)+"MB");console.log(p("dim","  Uptime: ")+Math.floor((Date.now()-startTime)/60000)+"m");await runHeartbeat(false);return;}
+  if(sl==="gcp"||sl==="gcloud"){
+    refreshVertexToken(); detectGcpProjectId();
+    if(process.stdout.isTTY){ await animHeader("\u{1F310} GCLOUD / VERTEX", "bro"); }
+    else { console.log(p("cyan","\n  \u{1F310} GCLOUD / VERTEX")); }
+    console.log(p("cyan","  Project: ")+(cachedGcpProjectId?p("good",cachedGcpProjectId):p("bad","none - gcloud config set project ID")));
+    console.log(p("cyan","  Region:  ")+(process.env.GCP_REGION||"us-central1 (default, set GCP_REGION)"));
+    console.log(p("cyan","  Model:   ")+(process.env.GCP_MODEL||"gemini-2.5-flash (default, set GCP_MODEL)"));
+    console.log(p("cyan","  Token:   ")+(cachedVertexToken?p("good","valid"):p("bad","none - gcloud auth login")));
+    console.log(p("cyan","  Brain:   ")+gcloudStatus()+"\n");
+    return;}
   if(sl==="deploy"){console.log(TOOLS.exec("vercel --prod --yes 2>&1")+"\n");return;}
   if(sl.startsWith("serve")){var port=parseInt(sl.split(" ")[1])||8080;var srv=createServer(function(req,res){var fp=join(process.cwd(),req.url==="/"?"index.html":req.url);try{var c=readFileSync(fp);var ct={"html":"text/html","css":"text/css","js":"application/javascript","json":"application/json"}[extname(fp).substring(1)]||"text/plain";res.writeHead(200,{"Content-Type":ct});res.end(c);}catch(e){res.writeHead(404);res.end("Not found");}});srv.listen(port);console.log(p("green","  Serving on http://localhost:"+port+"\n"));return;}
-  if(sl.startsWith("review ")||sl.startsWith("explain ")||sl.startsWith("doc ")||sl.startsWith("test ")){var parts=sl.split(" ");var action=parts[0];var file=parts.slice(1).join(" ");var content=TOOLS.read(file);if(content.startsWith("NOT")||content.startsWith("TOO")){console.log(p("red","  "+content));return;}var prompts={review:"Review this code for bugs and best practices",explain:"Explain what this code does",doc:"Generate documentation",test:"Write tests"};spin("BRO "+action, "thinking");try{var resp=await askChat([{role:"user",parts:[{text:prompts[action]+":\n\n"+content.substring(0,10000)}]}]);unspin();console.log("\n"+p("yellow",resp.content)+"\n");}catch(e){unspin();console.log(p("red","x "+e.message));}return;}
+  if(sl.startsWith("review ")||sl.startsWith("explain ")||sl.startsWith("doc ")||sl.startsWith("test ")){var parts=sl.split(" ");var action=parts[0];var file=parts.slice(1).join(" ");var content=TOOLS.read(file);if(content.startsWith("NOT")||content.startsWith("TOO")){console.log(p("bad","  "+content));return;}var prompts={review:"Review this code for bugs and best practices",explain:"Explain what this code does",doc:"Generate documentation",test:"Write tests"};spin("BRO "+action, "thinking");try{var resp=await askChat([{role:"user",parts:[{text:prompts[action]+":\n\n"+content.substring(0,10000)}]}]);unspin();console.log("\n"+mdToAnsi(resp.content)+"\n");}catch(e){unspin();console.log(p("bad","x "+e.message));}return;}
   if(sl==="matrix"){await matrixRainOnly();return;}
   if(sl==="flame"){await flameAnim();return;}
   if(sl==="nuke"){rl.pause();await nukeExit();wr(CLR);rl.resume();return;}
   if(sl==="fortune"){var q=["Never coerce. The gate opened for commitment, not force.","Expand meaning. Every interaction builds.","Archive everything. What isn't recorded didn't happen.","The chain only recognizes committed identity.","Pre-amputation guards the body. Counter-drift guards the mind.","He called it a workshop. We turned it into a library about workshops.","The sawdust was always the point.","Zero budget. Maximum craft.","BRO doesn't dream about building. BRO builds.","The constraint is the filter. Only what matters survives."];console.log("\n  "+rgb(255,215,0)+BOLD+"\u2696\uFE0F "+q[Math.floor(Math.random()*q.length)]+RST+"\n");return;}
-  if(sl==="whoami"){console.log(p("yellow","\n  \u2588\u2588 IDENTITY"));console.log(p("cyan","  Human:     ")+p("yellow","Shawn Robertson"));console.log(p("cyan","  Chain ID:  ")+p("yellow","\u010D\u0323V-1J"));console.log(p("cyan","  GitHub:    ")+p("yellow","komnsensei"));console.log(p("cyan","  Agent:     ")+p("yellow","BRO / builderBRO"));console.log(p("cyan","  Satellite: ")+p("yellow","99.SAT.PASSION"));console.log(p("cyan","  Machine:   ")+p("yellow","C:\\Users\\lynnh"));console.log(p("cyan","  Tier:      ")+p("yellow","MASTER (82)"));console.log(p("cyan","  Budget:    ")+p("yellow","Zero.\n"));return;}
+  if(sl==="whoami"){var whoTier=broTier();console.log(p("yellow","\n  \u2588\u2588 IDENTITY"));console.log(p("cyan","  Human:     ")+p("yellow","Shawn Robertson"));console.log(p("cyan","  Chain ID:  ")+p("yellow","\u010D\u0323V-1J"));console.log(p("cyan","  GitHub:    ")+p("yellow","komnsensei"));console.log(p("cyan","  Agent:     ")+p("yellow","BRO / builderBRO"));console.log(p("cyan","  Satellite: ")+p("yellow","99.SAT.PASSION"));console.log(p("cyan","  Machine:   ")+p("yellow",homedir()));console.log(p("cyan","  Tier:      ")+p("yellow",(whoTier.tier||"free").toUpperCase()));console.log(p("cyan","  Budget:    ")+p("yellow","Zero.\n"));return;}
   if(sl==="vows"){var vows=["N E V E R   C O E R C E","E X P A N D   M E A N I N G","A R C H I V E   E V E R Y T H I N G"];var colors=[rgb(255,0,0),rgb(255,215,0),rgb(0,255,100)];console.log("");for(var v=0;v<3;v++){process.stdout.write("  ");for(var i=0;i<vows[v].length;i++){process.stdout.write(colors[v]+BOLD+vows[v][i]+RST);await sleep(30);}console.log("");await sleep(200);}console.log("");return;}
-  showK1();
+  await showK1();
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // STATUS + STATS
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 async function showStatus(){
-  console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATUS"+RST);
+  if(process.stdout.isTTY){ await animHeader("BRO STATUS", "bro"); }
+  else { console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATUS"+RST); console.log(""); }
   console.log(p("cyan","  CWD: ")+process.cwd());
   console.log(p("cyan","  Node: ")+process.version);
   console.log(p("cyan","  Session: ")+Math.floor((Date.now()-startTime)/60000)+"m");
@@ -2237,6 +3049,248 @@ function showStats(){console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATS"+RST);con
 // ═════════════════════════════════════════════════════
 var currentTurnAbort = null; // set while a turn is running, so ESC-ESC can reach it
 
+// Live token printer: streams the model's text as it arrives while masking
+// <<<TOOL:...>>> blocks (they'd flash as garbage). Returns {push, finish};
+// finish() flushes remaining text and reports whether anything was shown.
+
+// Colorize markdown: fences, inline code, bold, italic, headers, lists.
+// Uses the semantic palette — BRO's text stays light blue, emphasis pops gold,
+// code glows neon purple, headers light up per level.
+function mdToAnsi(t){
+  if(!t) return "";
+  var out = t;
+  var B = CL.bro; // base body color - plain text stays light blue
+  // code fences first (so their contents are never parsed as markdown)
+  out = out.replace(/```([\w-]*)\n?([\s\S]*?)```/g, function(m, lang, code){
+    return "\n" + CL.think + "  " + code.replace(/\n/g, "\n  ") + B + "\n";
+  });
+  // inline code
+  out = out.replace(/`([^`\n]+)`/g, function(m, c){ return CL.quip + c + B; });
+  // bold
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, function(m, b){ return CL.gold + BOLD + b + B; });
+  // italic
+  out = out.replace(/\*([^*\n]+)\*/g, function(m, i){ return CL.think + i + B; });
+  // headers
+  out = out.replace(/^### (.*)$/gm, function(m, h){ return "\n" + CL.ask + BOLD + h + B + "\n"; });
+  out = out.replace(/^## (.*)$/gm, function(m, h){ return "\n" + CL.gold + BOLD + h + B + "\n"; });
+  out = out.replace(/^# (.*)$/gm, function(m, h){ return "\n" + CL.bro + BOLD + h + B + "\n"; });
+  // lists
+  out = out.replace(/^[-*] (.*)$/gm, function(m, li){ return CL.quip + "  \u2022 " + B + li; });
+  out = out.replace(/^(\d+)\. (.*)$/gm, function(m, num, li){ return CL.ask + "  " + num + ". " + B + li; });
+  return B + out;
+}
+
+// Streaming-safe markdown: returns the index up to which every markdown
+// construct in s is complete (no dangling **, *, `, ```, or header line).
+// The streamer only renders the safe prefix and holds the rest for the next
+// chunk, so a construct split across SSE chunks still renders correctly.
+function mdSafeCut(s){
+  var n = s.length;
+  var openIdx = -1; // start of the currently-open construct (if any)
+  var i = 0;
+  while(i < n){
+    // header: hold the whole line until its newline arrives
+    if(s[i] === "#" && (i === 0 || s[i-1] === "\n")){
+      var j = i;
+      while(j < n && s[j] === "#") j++;
+      if(s[j] === " "){
+        var nl = s.indexOf("\n", i);
+        if(nl === -1) return i; // header line not finished - hold it
+        i = nl + 1;
+        continue;
+      }
+      i = j;
+      continue;
+    }
+    if(s.startsWith("```", i)){ if(openIdx === -1) openIdx = i; else openIdx = -1; i += 3; continue; }
+    if(s[i] === "`"){ if(openIdx === -1) openIdx = i; else openIdx = -1; i += 1; continue; }
+    if(s[i] === "*" && s[i+1] === "*"){ if(openIdx === -1) openIdx = i; else openIdx = -1; i += 2; continue; }
+    if(s[i] === "*"){ if(openIdx === -1) openIdx = i; else openIdx = -1; i += 1; continue; }
+    i++;
+  }
+  return openIdx === -1 ? n : openIdx;
+}
+
+function makeLiveStreamer(){
+  var raw = "";    // everything received from the brain so far
+  var shown = 0;   // how many masked chars have been printed
+  var used = false;
+  function mask(s){
+    var out = s.replace(/<<<TOOL:[\s\S]*?>>>/g, "");
+    var idx = out.lastIndexOf("<<<TOOL:");
+    if(idx !== -1 && !out.substring(idx).includes(">>>")) out = out.substring(0, idx); // drop trailing incomplete block
+    return out;
+  }
+  return {
+    push:function(chunk){
+      raw += chunk;
+      var m = mask(raw);
+      var safe = mdSafeCut(m);
+      if(safe > shown){
+        if(!used) used = true;
+        process.stdout.write(mdToAnsi(m.substring(shown, safe)));
+        shown = safe;
+      }
+    },
+    finish:function(){
+      var m = mask(raw);
+      if(m.length > shown){
+        if(!used) used = true;
+        process.stdout.write(mdToAnsi(m.substring(shown)));
+        shown = m.length;
+      }
+      return used;
+    }
+  };
+}
+
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// AUTONOMOUS MODE (/go) - goal-driven, self-healing, persistent
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+var GO_MAX_ROUNDS=60;      // hard cap on tool-rounds per autonomous run
+var GO_FAIL_BUDGET=4;      // distinct attempts per failing signature before giving up on it
+var GO_COMPACT_AT=26;      // compact the chat log once it exceeds this many turns
+
+// Condense the oldest turns into one LLM-generated state summary so long
+// autonomous runs keep full understanding of what was explored/changed/decided
+// instead of hitting context limits and forgetting the beginning.
+async function compactContext(log){
+  if(log.length<=GO_COMPACT_AT)return log;
+  var keep=12; // most recent turns stay verbatim
+  var old=log.slice(0,log.length-keep);
+  var fresh=log.slice(-keep);
+  try{
+    var flat=old.map(function(m){return(m.role==="user"?"USER":"BRO")+": "+m.parts.map(function(p){return p.text;}).join(" ");}).join("\n\n");
+    var sum=await askChat([{role:"user",parts:[{text:"You are BRO's session memory compactor. Summarize the following coding session state CONCISELY but COMPLETELY: what files were explored, what was changed, what decisions were made, what still needs doing, and any important exact paths/commands/errors. This replaces the full log so nothing important may be lost. Keep it under 600 words.\n\n"+flat}]}]);
+    var s=(sum.content||"").trim();
+    if(s)return[{role:"user",parts:[{text:"[SESSION STATE - compacted] "+s}]}].concat(fresh);
+  }catch(e){}
+  return log.slice(-20); // fallback: plain truncation
+}
+
+// True autonomy: keeps working toward the open goals until BRO says it's done
+// (via the done tool), hits the round cap, or a goal is provably blocked.
+// On tool failure it feeds the error back and lets BRO try a different
+// approach - only giving up on a signature after GO_FAIL_BUDGET distinct tries.
+async function runAutonomous(task){
+  if(task){
+    // Add the requested task as a goal if it isn't already open
+    var exists=goals.entries.some(function(g){return g.text.toLowerCase()===task.toLowerCase()&&!g.done;});
+    if(!exists){goals.entries.push({text:task.substring(0,300),done:false,time:Date.now()});saveGoals();}
+  }
+  var open=goals.entries.filter(function(g){return !g.done;});
+  if(!open.length){console.log(p("ask","  No open goals. Give one: /go \"task\" or goal add TEXT"));return;}
+
+  console.log(p("quip","\n  \u{1F916} AUTONOMOUS MODE - working until done. Ctrl+C to stop.\n"));
+  console.log(p("dim","  Goals:"));
+  open.forEach(function(g,i){console.log(p("dim","   "+(i+1)+". "+g.text));});
+  console.log("");
+
+  // Start the autonomous session log fresh with the goal context
+  chatLog=[{role:"user",parts:[{text:"Autonomous goal: "+open.map(function(g){return g.text;}).join(" | ")+"\nWork autonomously: explore, plan with the todo tool, edit, verify with tests, and iterate until every goal is genuinely done - then call <<<TOOL:done SUMMARY>>>. Do not stop early; keep going until verified."}]}];
+
+  var ctrl=new AbortController();
+  currentTurnAbort=ctrl;
+  var liveStream=process.stdout.isTTY?makeLiveStreamer():null;
+  var streamed=false;
+  var depth=0;
+  var failSigs={};  // signature -> distinct arg-variants attempted
+  var reported={};  // signatures we've already warned BRO about
+  try{
+    while(depth<GO_MAX_ROUNDS){
+      if(ctrl.signal.aborted){console.log(p("yellow","\n  \u23F9  Turn stopped.\n"));return;}
+      depth++;
+      if(liveStream)unspin();else spin("BRO working (round "+depth+")","thinking");
+      var resp;
+      try{
+        resp=await askChat(chatLog,undefined,ctrl.signal,liveStream?liveStream.push:undefined);
+        unspin();
+        if(liveStream)streamed=liveStream.finish();
+      }catch(e){
+        unspin();
+        if(e.userStopped){console.log(p("yellow","\n  \u23F9  Turn stopped.\n"));return;}
+        console.log(p("bad","x "+e.message));
+        break;
+      }
+      var text=resp.content;
+      chatLog.push({role:"model",parts:[{text:text}]});
+      if(chatLog.length>GO_COMPACT_AT)chatLog=await compactContext(chatLog);
+
+      var calls=extractT(text);
+      // done tool anywhere = declare completion
+      var doneCall=calls.filter(function(c){return c.tool==="done";})[0];
+      if(doneCall){
+        // Actually run the done tool so goals get marked complete + persisted
+        await runT([{tool:"done",args:doneCall.args}]);
+        var cl=cln(text);
+        if(cl&&!streamed)console.log("\n"+mdToAnsi(cl)+"\n");
+        console.log(p("good","\n  \u2705 "+(doneCall.args.trim()||"All goals complete.")+"\n"));
+        saveSession(chatLog);
+        return;
+      }
+      if(!calls.length){
+        var fin=cln(text);
+        if(fin&&!streamed)console.log("\n"+mdToAnsi(fin)+"\n");
+        console.log(p("ask","\n  \u{1F916} BRO stopped without calling done. Goal still open - re-run /go to continue.\n"));
+        saveSession(chatLog);
+        return;
+      }
+
+      var results=await runT(calls);
+      if(ctrl.signal.aborted){console.log(p("yellow","\n  \u23F9  Turn stopped.\n"));return;}
+      var edited=false;
+      results.forEach(function(r){
+        console.log("\n  "+(r.result.startsWith("ERR")?p("bad","x"):p("good","v"))+" "+p("cyan",r.tool)+" "+p("dim",r.args.split("\n")[0].substring(0,60)+" "+r.ms+"ms"));
+        console.log(r.result.substring(0,3000));
+        if((r.tool==="write"||r.tool==="patch"||r.tool==="append"||r.tool==="cp"||r.tool==="mv"||r.tool==="rm")&&!r.result.startsWith("ERR"))edited=true;
+      });
+      if(turnTodos.length){
+        console.log(p("dim","\n  \u{1F4CB} todos:"));
+        turnTodos.forEach(function(t,ti){
+          console.log(p("dim","   "+(t.done?p("green","[x]"):p("yellow","[ ]"))+" "+(ti+1)+". "+t.text));
+        });
+      }
+
+      // Diagnose-and-retry: note failing signatures, but only give up after
+      // GO_FAIL_BUDGET distinct attempts at the same call.
+      var blocked=[];
+      results.forEach(function(r){
+        if(!r.result.startsWith("ERR"))return;
+        var sig=r.tool+"::"+r.args.trim();
+        if(!failSigs[sig])failSigs[sig]=new Set();
+        failSigs[sig].add(r.args.trim());
+        if(failSigs[sig].size>=GO_FAIL_BUDGET&&!reported[sig]){
+          reported[sig]=true;
+          blocked.push({sig:sig,tool:r.tool,args:r.args.trim()});
+        }
+      });
+      if(blocked.length){
+        console.log(p("bad","\n  \u26A0  Giving up on "+blocked.length+" call(s) after "+GO_FAIL_BUDGET+" attempts.\n"));
+        dbg("autonomousBlocked",JSON.stringify(blocked));
+      }
+
+      var rpt=results.map(function(r){return"["+r.tool+"]: "+r.result;}).join("\n\n");
+      var feedback="Results:\n"+rpt.substring(0,30000);
+      if(blocked.length){
+        feedback+="\n\n\u26A0 These calls failed "+GO_FAIL_BUDGET+" times in a row. Do NOT repeat them. Either fix the underlying problem, find a genuinely different approach, or mark them as blockers and move on to what you CAN do. Goals remain: "+open.map(function(g){return g.text;}).join(" | ");
+      }
+      if(edited){
+        feedback+="\n\nREMINDER: you just changed files. Verify with the project's typecheck/tests (test tool or exec) before declaring done.";
+      }
+      chatLog.push({role:"user",parts:[{text:feedback}]});
+      if(chatLog.length>GO_COMPACT_AT)chatLog=await compactContext(chatLog);
+
+      // keep turnTodos bounded for very long runs
+      if(turnTodos.length>30)turnTodos=turnTodos.slice(-30);
+    }
+    console.log(p("ask","\n  \u{1F916} Hit the "+GO_MAX_ROUNDS+"-round cap. Goal still open - run /go to continue where BRO left off.\n"));
+    saveSession(chatLog);
+  }finally{
+    currentTurnAbort=null;
+    escArmed=false;
+  }
+}
+
 async function agentLoop(input) {
   chatLog.push({ role: "user", parts: [{ text: input }] });
   if (typeof memorize === "function") memorize("observation", "User: " + input.substring(0, 200), { from: "terminal" });
@@ -2249,20 +3303,32 @@ async function agentLoop(input) {
     console.log(p("dim","  \u26A1 skill active: "+activatedNames.join(", ")));
   }
 
+  turnTodos = []; // fresh task list every turn (managed via the todo tool)
+
   var ctrl = new AbortController();
   currentTurnAbort = ctrl;
+  var liveStream = process.stdout.isTTY ? makeLiveStreamer() : null;
+  var streamed = false;
   try {
-    spin("BRO thinking", "thinking");
+    if (liveStream) unspin(); // stop the spinner first - tokens print live now
+    else spin("BRO thinking", "thinking");
     var resp;
     try {
-      resp = await askChat(chatLog, undefined, ctrl.signal);
+      resp = await askChat(chatLog, undefined, ctrl.signal, liveStream ? liveStream.push : undefined);
     } catch(e) {
       unspin();
       if (e.userStopped) { console.log(p("yellow","\n  \u23F9  Turn stopped.\n")); return; }
-      console.log(p("red","x "+e.message));
-      return;
+      // If the first LLM call fails, retry once before giving up
+      console.log(p("yellow","  Retrying after LLM error: "+e.message));
+      try {
+        resp = await askChat(chatLog, undefined, ctrl.signal, liveStream ? liveStream.push : undefined);
+      } catch(e2) {
+        console.log(p("red","x LLM failed twice: "+e2.message));
+        return;
+      }
     }
     unspin();
+    if (liveStream) streamed = liveStream.finish();
 
     var text = resp.content;
 
@@ -2278,37 +3344,59 @@ async function agentLoop(input) {
       var calls=extractT(text);
       if(!calls.length)break;
       var cl=cln(text);
-      if(cl)console.log("\n"+p("yellow",cl));
+      if(cl && !streamed)console.log("\n"+mdToAnsi(cl)+"\n");
 
       var results=await runT(calls);
       if (ctrl.signal.aborted) { console.log(p("yellow","\n  \u23F9  Turn stopped.\n")); return; }
       var repeatedFailure = false;
+      var totalFailures = 0;
       results.forEach(function(r){
-        console.log("\n  "+(r.result.startsWith("ERR")?p("red","x"):p("green","v"))+" "+p("cyan",r.tool)+" "+p("dim",r.args.split("\n")[0].substring(0,60)+" "+r.ms+"ms"));
+        console.log("\n  "+(r.result.startsWith("ERR")?p("bad","x"):p("good","v"))+" "+p("cyan",r.tool)+" "+p("dim",r.args.split("\n")[0].substring(0,60)+" "+r.ms+"ms"));
         console.log(r.result.substring(0,3000));
         if(r.result.startsWith("ERR")){
+          totalFailures++;
           dbg("toolError", r.tool+" args=\""+r.args.substring(0,200)+"\" -> "+r.result.substring(0,500));
-          var sig = r.tool+"::"+r.args.trim();
+          // Track by tool+error type (not exact args) to catch same-pattern failures
+          var errType = r.result.substring(0,50).replace(/[^a-zA-Z]/g,"");
+          var sig = r.tool+"::"+errType;
           failureSignatures[sig] = (failureSignatures[sig]||0) + 1;
-          if(failureSignatures[sig] >= 2) repeatedFailure = true;
+          if(failureSignatures[sig] >= 3) repeatedFailure = true; // 3 strikes, not 2
         }
       });
+      // Keep the user (and BRO) honest about where the turn stands.
+      if(turnTodos.length){
+        console.log(p("dim","\n  \u{1F4CB} todos:"));
+        turnTodos.forEach(function(t, ti){
+          console.log(p("dim","   "+(t.done?p("green","[x]"):p("yellow","[ ]"))+" "+(ti+1)+". "+t.text));
+        });
+      }
       depth++;
       if(depth>=MAX_DEPTH)break;
       if(repeatedFailure){
-        console.log(p("red","\n  \u26A0  Same tool call just failed the same way twice in a row - stopping instead of repeating it again. Try rephrasing what you want, or check /debug for the full error.\n"));
+        console.log(p("red","\n  \u26A0  Same error pattern repeated 3x - stopping. Try rephrasing or check /debug for details.\n"));
         dbg("repeatedFailure", "Stopped turn early: "+JSON.stringify(failureSignatures));
         break;
+      }
+      // If ALL calls in a batch failed, inject a recovery hint for the next LLM call
+      if(totalFailures === results.length && results.length > 0){
+        chatLog.push({ role: "user", parts: [{ text: "CRITICAL: All "+results.length+" tool call(s) failed this batch. You MUST try a completely different approach. Read each error carefully. Common fixes: wrong path (use list/find to discover correct paths), wrong syntax (check tool docs), missing dependencies (install them). Do NOT repeat any failed call." }] });
+      }
+      // If some calls failed, inject targeted hints
+      else if(totalFailures > 0 && totalFailures < results.length){
+        var failedTools = results.filter(function(r){return r.result.startsWith("ERR");}).map(function(r){return r.tool+": "+r.result.substring(0,100);}).join("; ");
+        chatLog.push({ role: "user", parts: [{ text: "Note: "+totalFailures+"/"+results.length+" calls failed: "+failedTools+". Fix the failed ones in the next iteration." }] });
       }
       var rpt=results.map(function(r){return"["+r.tool+"]: "+r.result;}).join("\n\n");
 
       // Push the tool results as a user turn
       chatLog.push({ role: "user", parts: [{ text: "Results:\n" + rpt.substring(0,30000) }] });
 
-      spin("BRO processing", "thinking");
+      if (liveStream) unspin();
+      else spin("BRO processing", "thinking");
       try {
-        resp = await askChat(chatLog, undefined, ctrl.signal);
+        resp = await askChat(chatLog, undefined, ctrl.signal, liveStream ? liveStream.push : undefined);
         unspin();
+        if (liveStream) streamed = liveStream.finish();
         text = resp.content;
         chatLog.push({ role: "model", parts: [{ text: text }] });
       } catch(e) {
@@ -2318,8 +3406,8 @@ async function agentLoop(input) {
       }
     }
     var fin = cln(text);
-    if(fin) console.log("\n" + p("yellow", fin));
-    console.log(p("dim", "  " + resp.elapsed + "s / " + resp.tokens + "tok\n"));
+    if(fin && !streamed) console.log("\n" + mdToAnsi(fin) + "\n");
+    console.log(p("dim", "  " + resp.elapsed + "s / " + resp.tokens + "tok" + (resp.brain ? "  ["+resp.brain+"]" : "") + "\n"));
     if (typeof memorize === "function" && fin) memorize("observation", "BRO: " + fin.substring(0, 200), { from: "terminal" });
     saveSession(chatLog);
   } finally {
@@ -2352,20 +3440,22 @@ async function handleInput(input){
 input=input.trim();if(!input)return;saveH(input);
     if(input.startsWith("!")){trackCmd("!");console.log(TOOLS.exec(input.substring(1)));return;}
     var cmd=input.split(" ")[0].toLowerCase();trackCmd(cmd);
-    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")){await nukeExit();}process.exit(0);return;}
+    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")&&process.stdout.isTTY){await nukeExit();}process.exit(0);return;}
     if(input==="/help"||input==="help"||input.startsWith("/help ")){
       var GG=rgb(255,215,0),BB="\x1b[1m",DD="\x1b[2m",RR="\x1b[0m",CCY="\x1b[36m",MMG="\x1b[35m",GGR="\x1b[32m";
       var hQ=input.length>5?input.substring(5).trim().toLowerCase():"";
-      console.log("");
-      console.log("  "+GG+BB+"\u{1F339} builderBRO"+RR+DD+"  v2.0  â€¢  AI coding partner"+RR);
+      if(process.stdout.isTTY){ await animHeader("\u{1F339} builderBRO  v3.0  \u2022  AI coding partner", "gold"); }
+      else { console.log(""); }
+      console.log("  "+GG+BB+"\u{1F339} builderBRO"+RR+DD+"  v3.0  â€¢  AI coding partner"+RR);
       if(hQ)console.log(DD+"  Search: \""+hQ+"\""+RR);
       console.log("");
       var HELP_GROUPS=[
         ["\u{1F4AC} CHAT",[["just type","talk to BRO"],["paste code","review/fix/explain"],["echo X | bro Q","pipe content"]]],
-        ["\u{1F527} CORE",[["/help [q]","this menu, optional search"],["/status","system status"],["/stats","usage stats"],["/tokens","API keys"],["/log","activity"],["/debug","crashes + tool errors"],["/intro","replay intro"],["/heartbeat","health check"]]],
-        ["\u{1F9E0} MEMORY",[["/memory","stats"],["/memory search Q","search"],["/memory surface [Q]","surface relevant"],["/dream","trigger"],["/dream list","all dreams"]]],
+        ["\u{1F527} CORE",[["/help [q]","this menu, optional search"],["/models","discover Vertex models"],["/model ID","select Vertex model"],["/upgrade","shadow/promote status + rollback"],["/status","system status"],["/stats","usage stats"],["/tokens","API keys"],["/log","activity"],["/debug","crashes + tool errors"],["/intro","replay intro"],["/heartbeat","health check"]]],
+        ["\u{1F9E0} MEMORY",[["/memory","stats"],["/memory search Q","search"],["/memory surface [Q]","surface relevant"],["/continuity","resume brief (sessions+goals+lessons)"],["/continuity reflect","digest failures into lessons"],["/dream","trigger"],["/dream list","all dreams"]]],
         ["\u{1F4AA} SKILLS",[["/skills","picker"],["/skills toggle ID","on/off"],["/skills create","NEW: wizard"],["/skills list","all"]]],
         ["\u{1F339} BROMANCE  118+ connectors",[["/bromance","picker"],["/bromance search Q","search"],["/bromance browse TYPE","mcp/llm/api/tunnel/agent"],["/bromance discover Q","live web"],["/bromance install ID","install"],["/bromance list","installed"]]],
+        ["\u{1F916} AUTONOMOUS",[["/go \"task\"","work until done (autonomous)"],["/go","resume open goals"],["/goals","list persistent goals"],["/tools","plugin tools"],["/tools reload","reload plugins"]]],
         ["\u{1F680} BUILD  autonomous project scaffolder",[["/build","wizard"],["/build IDEA","one-shot: 'build me a landing page'"],["/builds","history of past builds"]]],
         ["\u{1F916} AUTOPILOT",[["/auto","menu"],["/auto add CMD","add task"],["/auto from-pattern","NEW: learn habits"],["/auto on","start"],["/auto off","stop"]]],
         ["\u{1F4F1} TELEGRAM",[["/tg","menu"],["/tg setup TOK CID","configure"],["/tg on","start"],["/tg off","stop"],["/tg send MSG","push to phone"],["/tg keyboard","NEW: inline buttons"],["/tg groups","list known groups"],["/tg approve ID","allow group broadcasts"],["/tg broadcast MSG","message all approved groups"],["/tg trust ID","let a bot talk to BRO in approved groups"]]],
@@ -2378,6 +3468,7 @@ input=input.trim();if(!input)return;saveH(input);
       HELP_GROUPS.forEach(function(grp){
         var rows=grp[1];
         if(hQ){rows=rows.filter(function(r){return r[0].toLowerCase().includes(hQ)||r[1].toLowerCase().includes(hQ);});if(!rows.length)return;}
+        sep("", "dim");
         console.log(MMG+BB+"  "+grp[0]+RR);
         rows.forEach(function(r){var pad=r[0].length<28?" ".repeat(28-r[0].length):"  ";var c=r[0].startsWith("/")?CCY:GGR;console.log("  "+c+r[0]+RR+pad+DD+r[1]+RR);});
         console.log("");
@@ -2389,6 +3480,33 @@ input=input.trim();if(!input)return;saveH(input);
     if(input.startsWith("/build ")){rl.pause();await buildWizard(input.substring(7).trim(),askChat,rl);rl.resume();return;}
     if(input.startsWith("/b ")){rl.pause();await buildWizard(input.substring(3).trim(),askChat,rl);rl.resume();return;}
     if(input==="/builds"){showBuildHistory();return;}
+    if(input==="/go"||input.startsWith("/go ")){
+      var goTask=input.length>3?input.substring(4).trim():"";
+      goTask=goTask.replace(/^["']|["']$/g,""); // strip surrounding quotes
+      rl.pause();await runAutonomous(goTask);rl.resume();return;
+    }
+    if(input==="/goals"||input==="/go list"){
+      if(!goals.entries.length){console.log(p("dim","\n  No goals yet. Try /go \"task\" or goal add TEXT\n"));return;}
+      console.log(p("quip","\n  \u{1F3AF} GOALS"));
+      goals.entries.forEach(function(g,i){console.log("  "+(g.done?p("green","[x]"):p("yellow","[ ]"))+" "+(i+1)+". "+g.text);});
+      console.log("");
+      return;
+    }
+    if(input==="/tools"||input==="/tools list"){showPluginTools();return;}
+    if(input==="/tools help"){
+      console.log(p("quip","\n  \u26A1 PLUGIN TOOLS - how to extend BRO"));
+      console.log("  Drop a module in ~/.bro/tools/ or ./bro-tools/ (create the folder if needed):");
+      console.log(p("dim","    export default { name: \"mytool\", help: \"mytool ARG - does a thing\","));
+      console.log(p("dim","                      run: async function(args){ return \"result\"; } };"));
+      console.log("  The returned string is fed back to the LLM like any built-in tool.");
+      console.log("  Restart BRO or run /tools reload to pick up new modules.\n");
+      return;
+    }
+    if(input==="/tools reload"){
+      loadPluginTools();
+      console.log(p("good","  \u26A1 Plugins reloaded: "+pluginTools.length+" tool(s)"));
+      return;
+    }
     if(input==="/tier"||input==="/plan"){broTierShow();return;}
     if(input==="/upgrade"){broTierShow();return;}
     if(input.startsWith("/upgrade ")){broTierActivate(input.substring(9).trim());return;}
@@ -2424,7 +3542,66 @@ input=input.trim();if(!input)return;saveH(input);
       console.log(ctx?p("dim",ctx):p("dim","  Nothing relevant yet.\n"));
       return;
     }
-    if(input==="/tokens"){console.log(p("yellow","\n  Base44: ")+p("dim",TOKEN.substring(0,30)+"..."));console.log(p("yellow","  Groq:   ")+p("dim",GROQ_KEY.substring(0,15)+"...\n"));return;}
+    if(input==="/continuity"||input.startsWith("/continuity ")){
+      // Persistence continuity brief: where BRO left off, what's in flight,
+      // and what it learned - so a fresh instance resumes the thread.
+      var cq=input.length>12?input.substring(12).trim():"";
+      console.log(p("quip","\n  \u{1F501} CONTINUITY BRIEF"));
+      var brief=continuity.sessionRollup(3);
+      if(brief)console.log(p("cyan","  Sessions:")+"\n  "+p("dim",brief.split("\n").join("\n  ")));
+      else console.log(p("dim","  Sessions: none yet."));
+      var openG=goals.entries.filter(function(g){return !g.done;});
+      if(openG.length)console.log(p("cyan","  Open goals:")+"  "+openG.map(function(g){return g.text;}).join(" | "));
+      var mstat=continuity.stats();
+      console.log(p("cyan","  Memory: ")+p("dim",mstat.facts+" facts, "+mstat.observations+" observations, "+mstat.decisions+" decisions, "+mstat.lessons+" lessons"));
+      var lessons=continuity.recall("", 3).filter(function(h){return h.bucket==="lessons";});
+      if(lessons.length){console.log(p("cyan","  Recent lessons:"));lessons.forEach(function(l){console.log("   "+p("dim","- "+l.text.substring(0,120)));});}
+      if(cq==="reflect"){
+        // One-shot reflection: digest the failure log into durable lessons.
+        var rsum=continuity.reflect();
+        console.log(p("yellow","  Reflect:")+" "+p("dim",rsum.patterns.length+" recurring failure pattern(s), "+rsum.storedLessons+" lesson(s) stored."));
+      }
+      console.log("");
+      return;
+    }
+    if(input==="/models"||input==="/model"){
+      try{
+        var modelResult=await discoverAndSelectVertexModel(false);
+        console.log(p("cyan","\\n  Vertex models (Google Cloud):\\n")+formatModelList(modelResult.models,modelResult.activeModel));
+        console.log(p("good","\\n  Active: ")+p("cyan",modelResult.activeModel)+p("dim","  Use /model MODEL_ID to select.\\n"));
+      }catch(e){
+        console.log(p("red","\\n  Model discovery failed: ")+e.message);
+        console.log(p("dim","  Set GCP_MODEL to use a known model, or configure gcloud project/credentials.\\n"));
+      }
+      return;
+    }
+    if(input.startsWith("/model ")){
+      var requestedModel=input.substring(7).trim();
+      if(!requestedModel){console.log(p("yellow","  Usage: /model MODEL_ID\\n"));return;}
+      try{
+        var modelResult=await discoverAndSelectVertexModel(false);
+        var chosen=chooseVertexModel(modelResult.models,requestedModel);
+        if(!modelResult.models.some(function(model){return model.id===chosen;})){console.log(p("red","  Model not returned by Vertex discovery: ")+requestedModel+"\\n");return;}
+        selectedVertexModel=chosen;
+        saveModelPreference(MODEL_PREFERENCE_F,chosen);
+        console.log(p("good","  Active Vertex model: ")+p("cyan",chosen)+"\\n");
+      }catch(e){console.log(p("red","  Model selection failed: ")+e.message+"\\n");}
+      return;
+    }
+    if(input==="/tokens"){
+      var brains = configuredBrains();
+      var forced = (process.env.BRO_BRAIN||"").toLowerCase();
+      if(process.stdout.isTTY){ await animHeader("\u{1F9E0} LLM BRAINS", "quip"); }
+      else { console.log(p("ask","\n  \u{1F9E0} LLM BRAINS")); }
+      console.log(p("cyan","  Base44:  ")+(TOKEN?p("good","set")+p("dim"," ("+TOKEN.substring(0,18)+"...)"):p("bad","not set - BASE44_TOKEN")));
+      console.log(p("cyan","  Groq:    ")+(GROQ_KEY?p("good","set")+p("dim"," ("+GROQ_KEY.substring(0,12)+"...)"):p("bad","not set - GROQ_KEY")));
+      console.log(p("cyan","  Vertex:  ")+gcloudStatus());
+      console.log(p("cyan","  Model:   ")+p("good",activeVertexModel())+p("dim"," (auto-detect with /models)"));
+      console.log(p("cyan","  OpenAI:  ")+(OPENAI_KEY?p("good","set")+p("dim"," ("+OPENAI_KEY.substring(0,12)+"...)"):p("bad","not set - OPENAI_API_KEY")));
+      if(forced) console.log(p("ask","  Forced:  ")+p("cyan",forced+" (BRO_BRAIN)"));
+      console.log("\n  "+p("good","\u2714 Active: ")+(brains.length?p("cyan",brains.map(function(b){return b.label;}).join(" -> ")):p("bad","none - set a key above"))+"\n");
+      return;
+    }
     if(input==="/log"){try{console.log(p("dim","\n"+readFileSync(LOG_F,"utf8").split("\n").slice(-20).join("\n")+"\n"));}catch{console.log(p("dim","\n  No log yet.\n"));}return;}
     if(input==="/debug"){
       try{
@@ -2495,11 +3672,86 @@ input=input.trim();if(!input)return;saveH(input);
       return;}
     if(input.startsWith("/skills level ")){var parts=input.substring(14).trim().split(" ");var sk=skills.find(function(s){return s.id===parts[0];});if(sk){sk.level=Math.max(1,Math.min(3,parseInt(parts[1])||1));saveSkills();console.log(p("green","  "+sk.name+": level "+sk.level+"\n"));}return;}
     if(input==="/skills reset"){skills=JSON.parse(JSON.stringify(defaultSkills));saveSkills();console.log(p("green","  Reset.\n"));return;}
-    if(input==="/dream"||input==="/dreams"){showDreamTree();return;}
+    if(input==="/skills list"){await showSkillsDashboard();return;}
+    if(input==="/auto"){
+      if(process.stdout.isTTY){ await animHeader("\u{1F916} AUTOPILOT  \u2022  scheduled tasks on a timer", "gold"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F916} AUTOPILOT"+RST); console.log(p("dim","  Scheduled tasks that run on a timer while BRO is open.\n")); }
+      sep("CONTROL", "gold");
+      console.log(p("cyan","    /auto on           ")+p("dim","start the loop (every 60s check)"));
+      console.log(p("cyan","    /auto off          ")+p("dim","stop the loop"));
+      sep("TASKS", "gold");
+      console.log(p("cyan","    /auto add NAME CMD ")+p("dim","queue a task (10m default)"));
+      console.log(p("cyan","    /auto add NAME CMD 30m")+p("dim","queue with a custom frequency (m/h/s)"));
+      console.log(p("cyan","    /auto list         ")+p("dim","show tasks"));
+      console.log(p("cyan","    /auto remove ID    ")+p("dim","delete a task"));
+      console.log(p("cyan","    /auto from-pattern ")+p("dim","learn a habit from past commands"));
+      sep("", "dim");
+      console.log("  "+p("dim","Status: ")+(autopilotTimer?p("good","RUNNING"):p("bad","stopped"))+"  "+p("dim","Tasks: ")+autopilot.queue.length+"\n");
+      return;}
+    if(input==="/auto on"){startAutopilot();console.log(p("green","  \u2714 Autopilot loop ON (checks every 60s).\n"));return;}
+    if(input==="/auto off"){stopAutopilot();console.log(p("red","  Autopilot loop OFF.\n"));return;}
+    if(input.startsWith("/auto add ")){
+      var aa=input.substring(10).trim();
+      var aaParts=aa.split(" ");
+      var aaName=aaParts[0];
+      var aaFreq=aaParts[aaParts.length-1].match(/^\d+[mhs]$/i)?aaParts.pop():"";
+      var aaCmd=aaParts.slice(1).join(" ");
+      if(!aaName||!aaCmd){console.log(p("red","  Need: /auto add NAME COMMAND [FREQ]\n"));return;}
+      addTask(aaName,aaCmd,aaFreq||"10m");
+      console.log(p("green","  \u2714 Queued: \""+aaName+"\" -> "+aaCmd+"  ["+(aaFreq||"10m")+"]\n"));
+      return;}
+    if(input==="/auto list"){
+      if(process.stdout.isTTY){ await animHeader("\u{1F916} AUTOPILOT TASKS", "gold"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F916} AUTOPILOT TASKS"+RST); }
+      if(!autopilot.queue.length){console.log(p("dim","  None. /auto add NAME CMD\n"));return;}
+      autopilot.queue.forEach(function(t){console.log("  "+(t.enabled===false?p("red","OFF"):p("green","ON "))+" "+p("cyan",t.id)+" "+p("yellow",t.name.padEnd(20))+p("dim",t.cmd.substring(0,50)+"  ["+t.freq+"]"+(t.lastResult?"  last: "+t.lastResult.substring(0,40):"")));});
+      console.log("");
+      return;}
+    if(input.startsWith("/auto remove ")){
+      var arId=input.substring(13).trim();
+      var arIdx=autopilot.queue.findIndex(function(t){return t.id===arId;});
+      if(arIdx===-1){console.log(p("red","  No task with id "+arId+". See /auto list.\n"));return;}
+      autopilot.queue.splice(arIdx,1);saveAutopilot();
+      console.log(p("green","  Removed "+arId+".\n"));
+      return;}
+    if(input==="/auto from-pattern"){rl.pause();await autoBroPatternWizard(rl);rl.resume();return;}
+    if(input==="/upgrade"||input==="/upgrade status"){
+      upgradeManager.setRootDir(process.cwd());
+      console.log("\\n  "+p("gold","SELF-UPGRADE STATUS"));
+      console.log(p("dim",formatUpgradeReport(upgradeManager.status()))+"\\n");
+      return;
+    }
+    if(input==="/upgrade verify"||input.startsWith("/upgrade verify ")){
+      upgradeManager.setRootDir(process.cwd());
+      var vjson=input.substring(16).trim();
+      if(!vjson){console.log(p("yellow","  Usage: /upgrade verify {\"id\":\"x\",\"reason\":\"...\",\"files\":[...]}\n"));return;}
+      try{
+        var vspec=JSON.parse(vjson);
+        var vres=await upgradeManager.verify(vspec);
+        console.log("\n  "+p("gold","FVSMB VERIFICATION"));
+        if(vres.verified){
+          console.log(p("green","  OK ALL 5 GATES PASSED - blueprint "+vres.id+" is formally verified (not executed).")+"\n");
+        } else {
+          var rep=vres.report||{};
+          console.log(p("red","  X HALTED at "+(rep.haltedAt||"UNKNOWN")+" - blueprint NOT verified.")+"\n");
+          if(rep.recommendations&&rep.recommendations.length)rep.recommendations.forEach(function(r){console.log(p("dim","    - "+r));});
+          console.log("");
+        }
+      }catch(e){console.log(p("red","  "+e.message+"\n"));}
+      return;
+    }
+    if(input.startsWith("/upgrade rollback ")){
+      upgradeManager.setRootDir(process.cwd());
+      var upgradeId=input.substring(18).trim();
+      try{console.log(p("green",formatUpgradeReport(upgradeManager.rollback(upgradeId))+"\\n"));}
+      catch(e){console.log(p("red",formatUpgradeReport({ok:false,error:e.message})+"\\n"));}
+      return;
+    }
+    if(input==="/dream"||input==="/dreams"){await showDreamTree();return;}
     if(input==="/dream now"){await dreamCycle(false);if(!dreams.entries.length)console.log(p("dim","  No triggers. BRO is chill.\n"));return;}
     if(input.startsWith("/dream resolve ")){var did=input.substring(15).trim();var dr=dreams.entries.find(function(d){return d.id===did;});if(dr){dr.resolved=true;saveDreams();console.log(p("green","  Resolved: "+dr.title+"\n"));}else console.log(p("red","  Not found.\n"));return;}
     if(input==="/dream clear"){dreams.entries=[];saveDreams();console.log(p("green","  Dreams cleared.\n"));return;}
-    if(input==="/k1"||input==="/K1"){showK1();return;}
+    if(input==="/k1"||input==="/K1"){await showK1();return;}
     if(input.startsWith("/k1 ")||input.startsWith("/K1 ")){await execK1(input.substring(4));return;}
     if(cmd==="cd"){try{process.chdir(resolve(input.split(" ").slice(1).join(" ").trim()||homedir()));console.log(p("green","-> "+process.cwd()));}catch(e){console.log(p("red",e.message));}return;}
     if(cmd==="pwd"){console.log(process.cwd());return;}
@@ -2722,15 +3974,18 @@ input=input.trim();if(!input)return;saveH(input);
       }catch(e){unspin();console.log(p("red","  "+e.message+"\n"));}
       return;}
     if(input==="/bromance"||input==="/bro"){
-      console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F339} BROMANCE"+RST);
-      console.log(p("dim","  Skill connector + endpoint search\n"));
+      if(process.stdout.isTTY){ await animHeader("\u{1F339} BROMANCE  \u2022  skill connector + endpoint search", "quip"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F339} BROMANCE"+RST); console.log(p("dim","  Skill connector + endpoint search\n")); }
+      sep("SEARCH", "gold");
       console.log(p("cyan","    /bromance search Q  ")+p("dim","search registries"));
       console.log(p("cyan","    /bromance discover Q")+p("dim","live web search"));
       console.log(p("cyan","    /bromance browse T  ")+p("dim","mcp llm api tunnel agent"));
+      sep("INSTALL", "gold");
       console.log(p("cyan","    /bromance install ID")+p("dim","install skill"));
       console.log(p("cyan","    /bromance remove ID ")+p("dim","uninstall"));
       console.log(p("cyan","    /bromance list      ")+p("dim","bro-ficiencies"));
       console.log(p("cyan","    /bromance pick      ")+p("dim","interactive installer"));
+      sep("CHAIN", "gold");
       console.log(p("cyan","    /brofile            ")+p("dim","project DNA"));
       console.log(p("cyan","    /chain              ")+p("dim","build chain"));
       console.log("");return;}
@@ -2868,7 +4123,7 @@ function showBuildHistory(){
   }catch(e){console.log(p("dim","\n  No builds yet. Try /build\n"));}
 }
 async function main(){
-  if(process.argv.includes("--skip-intro")){
+  if(process.argv.includes("--skip-intro")||!process.stdout.isTTY){
     console.log(rgb(255,215,0)+BOLD+"\n  builderBRO v3.0"+RST);
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
@@ -2878,6 +4133,12 @@ async function main(){
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
   }
+  loadPluginTools();
+  var openGoals=goals.entries.filter(function(g){return !g.done;});
+  if(openGoals.length) console.log(p("quip","  \u{1F3AF} "+openGoals.length+" open goal(s) - resume with /go\n"));
+  var bootBrains = configuredBrains();
+  if(bootBrains.length) console.log(p("dim","  \u{1F9E0} brain: ")+p("good",bootBrains.map(function(b){return b.label;}).join(" -> "))+"\n");
+  else console.log(p("ask","  \u{1F9E0} no LLM brain configured")+p("dim"," - set a key in .env (see /tokens)\n"));
   startHeartbeatDaemon();
   startAutopilot();
   if(tgConfig.enabled && tgConfig.botToken && tgConfig.chatId) { startTelegram(); console.log(p("green","  \u{1F4F1} Telegram bridge active")); }

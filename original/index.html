@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stake Originals Helper</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Stake Originals Helper: Mines</h1>
+
+        <div class="game-area">
+            <div class="grid-container" id="gameGrid">
+                <!-- Grid cells will be injected here by JavaScript -->
+            </div>
+
+            <div class="controls">
+                <button id="markSafeBtn">Mark Safe</button>
+                <button id="markMineBtn">Mark Mine</button>
+                <button id="startNewRoundBtn">Start New Round</button>
+            </div>
+        </div>
+
+        <div class="insights">
+            <h2>Insights</h2>
+            <p>Total Rounds: <span id="totalRounds">0</span></p>
+            <p>Wins: <span id="totalWins">0</span> (<span id="winPercentage">0.00</span>%)</p>
+            <p>Losses: <span id="totalLosses">0</span> (<span id="lossPercentage">0.00</span>%)</p>
+            <p>Overall Cell Reveal: Safe <span id="overallSafeRatio">0.00</span>% | Mine <span id="overallMineRatio">0.00</span>%</p>
+
+            <h3>Cell Probability (Selected Cell: <span id="selectedCellCoords">N/A</span>)</h3>
+            <p>Times this cell was Safe: <span id="cellSafeCount">0</span></p>
+            <p>Times this cell was Mine: <span id="cellMineCount">0</span></p>
+            <p>Probability Safe: <span id="cellProbSafe">0.00</span>%</p>
+            <p>Probability Mine: <span id="cellProbMine">0.00</span>%</p>
+        </div>
+
+        <div class="history-log">
+            <h2>Round History</h2>
+            <ul id="historyList">
+                <!-- Round history will be appended here -->
+            </ul>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

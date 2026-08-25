@@ -1,0 +1,11 @@
+--- Setting up DyCRAG Environment ---
+DEBUG: Checking python3 availability...
+/data/data/com.termux/files/usr/bin/python3
+DEBUG: Current directory for run.sh: /storage/emulated/0/Download/builderbro/dycrag_system
+--- Starting DyCRAG Agent Demonstration ---
+
+DEBUG: Attempting to run python3 main.py...
+DEBUG: main.py started execution.
+
+--- DyCRAG Demonstration Complete ---
+To clean up, you can manually remove the 'dycrag_system' directory.

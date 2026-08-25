@@ -5,11 +5,43 @@ import { createInterface, emitKeypressEvents } from "readline";
 import { resolve, join, dirname, basename, extname } from "path";
 import { homedir } from "os";
 import { createServer } from "http";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import { buildWizard } from "./bro-build.mjs";
+import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, formatModelList, modelPreferencePath } from "./model-selector.mjs";
 
 const require = createRequire(import.meta.url);
+
+// ── .env loader ──────────────────────────────────────────────
+// Auto-loads KEY=VALUE pairs so BRO finds its LLM keys without you
+// exporting them. Checks, in order: current directory, this script's
+// folder, then ~/.bro/.env. Real environment variables always win.
+(function loadDotEnv(){
+  var candidates = [
+    join(process.cwd(), ".env"),
+    join(dirname(fileURLToPath(import.meta.url)), ".env"),
+    join(homedir(), ".bro", ".env")
+  ];
+  for (var i=0;i<candidates.length;i++){
+    var seen = {};
+    try{
+      if(!existsSync(candidates[i])) continue;
+      readFileSync(candidates[i], "utf8").split(/\r?\n/).forEach(function(line){
+        line = line.trim();
+        if(!line || line.startsWith("#") || seen[line]) return;
+        seen[line] = true;
+        line = line.replace(/^export\s+/,"");
+        var eq = line.indexOf("=");
+        if(eq === -1) return;
+        var k = line.substring(0,eq).trim();
+        var v = line.substring(eq+1).trim().replace(/^["']|["']$/g,"");
+        if(!k) return;
+        if(!process.env[k]) process.env[k] = v;
+      });
+    }catch(e){ /* unreadable .env - skip */ }
+  }
+})();
 
 // bromance.mjs powers /bromance, /skills list, /chain, /brofile, etc. - all of it
 // reads from globalThis.__bromance, but nothing was ever setting that global, so
@@ -36,7 +68,7 @@ await loadBromanceModule();
 const commandList = [
   '/help', '/status', '/queue', '/memory', '/thought', 
   '/paste', '/exit', '/quit', '/build', '/skills', 
-  '/auto', '/tg', '/chain', '/k1', '/tier', '/upgrade'
+  '/auto', '/tg', '/chain', '/k1', '/tier', '/upgrade', '/models', '/model'
 ];
 
 // Corrected initialization with the comma added
@@ -99,6 +131,14 @@ rl.on("line", function(line){
   // Explicit /paste mode already accumulates lines itself and needs to see
   // each one individually (to detect /end) - bypass coalescing entirely.
   if (isPasting || line.trim() === "/paste") {
+    inputQueue.push(line);
+    drainInputQueue();
+    return;
+  }
+  // Non-TTY (piped/scripted) input: every line is a deliberate command - process
+  // it immediately. Coalescing is only for real interactive pastes, where a
+  // human's multi-line paste arrives as one burst and should become one message.
+  if (!process.stdin.isTTY) {
     inputQueue.push(line);
     drainInputQueue();
     return;
@@ -822,12 +862,64 @@ var APP="69d81ac3ffa24327b49b171a",CONV="69f9a8f3e048816e89717604",MAX_DEPTH=5,M
 var GROQ_KEY=process.env.GROQ_KEY||"";
 var TAVILY_KEY=process.env.TAVILY_KEY||"";
 var GITHUB_TOKEN=process.env.GITHUB_TOKEN||"";
+var OPENAI_KEY=process.env.OPENAI_API_KEY||"";
+var MODEL_PREFERENCE_F=modelPreferencePath(DATA_DIR);
+var selectedVertexModel=process.env.GCP_MODEL||loadModelPreference(MODEL_PREFERENCE_F)||"";
+var discoveredVertexModels=[];
+var modelDiscoveryPromise=null;
+function activeVertexModel(){ return selectedVertexModel || process.env.GCP_MODEL || "gemini-2.5-flash"; }
+async function discoverAndSelectVertexModel(force){
+  if(modelDiscoveryPromise&&!force)return modelDiscoveryPromise;
+  modelDiscoveryPromise=(async function(){
+    var context=detectGoogleCloudContext();
+    if(!context.token||!context.projectId)throw new Error("Google Cloud credentials/project not detected");
+    var result=await discoverVertexModels({context:context});
+    discoveredVertexModels=result.models;
+    var next=chooseVertexModel(discoveredVertexModels,selectedVertexModel||process.env.GCP_MODEL||"");
+    selectedVertexModel=next;
+    if(!process.env.GCP_MODEL)saveModelPreference(MODEL_PREFERENCE_F,next);
+    return {context:context,models:discoveredVertexModels,activeModel:next};
+  })();
+  try{return await modelDiscoveryPromise;}catch(e){modelDiscoveryPromise=null;throw e;}
+}
 var GH_CONFIG_F=join(DATA_DIR,"github.json");
 var ghConfig;try{ghConfig=JSON.parse(readFileSync(GH_CONFIG_F,"utf8"));}catch{ghConfig={defaultRepo:""};}
 function saveGhConfig(){try{writeFileSync(GH_CONFIG_F,JSON.stringify(ghConfig,null,2),"utf8");}catch{}}
 
-var CL={reset:"\x1b[0m",bold:"\x1b[1m",dim:"\x1b[2m",red:"\x1b[31m",green:"\x1b[32m",yellow:"\x1b[33m",blue:"\x1b[34m",cyan:"\x1b[36m",magenta:"\x1b[35m"};
+var CL={reset:"\x1b[0m",bold:"\x1b[1m",dim:"\x1b[2m",red:"\x1b[31m",green:"\x1b[32m",yellow:"\x1b[33m",blue:"\x1b[34m",cyan:"\x1b[36m",magenta:"\x1b[35m",
+  // semantic palette
+  good:rgb(0,255,120),      // bright green — fixes that are good
+  bad:rgb(255,70,70),       // bright red — bad
+  bro:rgb(120,200,255),     // light blue — BRO's messaging
+  think:rgb(120,120,140),   // faint — thinking
+  quip:rgb(200,80,255),     // neon purple — quips
+  ask:rgb(255,215,0),       // yellow — BRO's questions / needs a pick
+  gold:rgb(255,215,0)       // alias for the classic gold
+};
 function p(c,t){return CL[c]+t+CL.reset;}
+// Separator line, optionally with a centered label: sep() or sep("SCAN") or sep("SCAN","good")
+function sep(label, color){
+  var c = CL[color||"dim"];
+  var bar = c + "\u2500".repeat(30) + CL.reset;
+  if(label) bar = c + "\u2500".repeat(22) + CL.reset + " " + CL.bold + CL[color||"gold"] + label + CL.reset + " " + c + "\u2500".repeat(22) + CL.reset;
+  console.log("  " + bar);
+}
+// Animated menu header: types the title with a pulsing color shimmer, then a separator.
+async function animHeader(title, color){
+  var base = CL[color||"quip"];
+  var txt = "  " + title;
+  var out = "";
+  for(var i=0;i<txt.length;i++){
+    var pulse = 140 + Math.floor(100*Math.sin(i/2.2));
+    var ch = (i<2) ? CL[color||"quip"] : rgb(Math.min(255,200+Math.floor(pulse*0.3)), Math.min(255,80+Math.floor(pulse*0.5)), 255);
+    out += ch + BOLD + txt[i] + RST;
+  }
+  process.stdout.write(out);
+  await sleep(120);
+  process.stdout.write("\n");
+  sep("", color||"dim");
+  console.log("");
+}
 function lg(m){try{appendFileSync(LOG_F,new Date().toISOString()+" "+m+"\n");}catch{}}
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1371,7 +1463,9 @@ function spin(m, quipCategory){
       spinCurrentText = broQuip(spinQuipCtx);
       spinQuipRefreshedAt = Date.now();
     }
-    process.stdout.write("\r"+CL.cyan+SP2[sii++%SP2.length]+" "+spinCurrentText+CL.reset+"   ");
+    // quips in neon purple, plain thinking text faint
+    var body = spinQuipCtx ? (CL.quip+spinCurrentText+CL.reset) : (CL.think+spinCurrentText+CL.reset);
+    process.stdout.write("\r"+CL.think+SP2[sii++%SP2.length]+CL.reset+" "+body+"   ");
   },80);
 }
 function unspin(){if(stt){clearInterval(stt);stt=null;}spinQuipCtx=null;process.stdout.write("\r"+" ".repeat(60)+"\r");}
@@ -1603,9 +1697,10 @@ async function interactiveSelect(items, opts) {
   });
 }
 
-function showSkillsDashboard(){
+async function showSkillsDashboard(){
   var G=rgb(255,215,0);var P=rgb(180,0,255);var GR=rgb(0,255,100);var R=RST;var B=BOLD;
-  console.log("\n"+G+B+"  \u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550"+R+"\n");
+  if(process.stdout.isTTY){ await animHeader("\u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550", "good"); }
+  else { console.log("\n"+G+B+"  \u2550\u2550\u2550 BRO SKILLS DASHBOARD \u2550\u2550\u2550"+R+"\n"); }
   var cats={core:"CORE",devops:"DEVOPS",connect:"CONNECT",ai:"AI",system:"SYSTEM",security:"SECURITY",cognitive:"COGNITIVE"};
   var lastCat="";
   skills.forEach(function(s){
@@ -1794,15 +1889,17 @@ async function dreamCycle(silent){
   saveDreams();return triggered;
 }
 
-function showDreamTree(){
+async function showDreamTree(){
   var G=rgb(255,215,0);var P=rgb(180,0,255);var R=RST;var B=BOLD;
-  console.log("\n"+P+B+"  \u{1F319} BRO DREAM ENGINE"+R+"\n");
+  if(process.stdout.isTTY){ await animHeader("\u{1F319} BRO DREAM ENGINE", "quip"); }
+  else { console.log("\n"+P+B+"  \u{1F319} BRO DREAM ENGINE"+R+"\n"); }
   if(dreams.entries.length===0){console.log("  "+p("dim","No dreams yet. BRO dreams during idle heartbeats.\n"));return;}
   var groups={nightmare:[],warning:[],insight:[],dream:[]};
   dreams.entries.slice(-30).forEach(function(d){if(groups[d.type])groups[d.type].push(d);});
-  var icons={nightmare:p("red","\u2588 NIGHTMARES"),warning:p("yellow","\u2588 WARNINGS"),insight:p("cyan","\u2588 INSIGHTS"),dream:p("magenta","\u2588 DREAMS")};
+  var icons={nightmare:p("bad","\u2588 NIGHTMARES"),warning:p("ask","\u2588 WARNINGS"),insight:p("bro","\u2588 INSIGHTS"),dream:p("quip","\u2588 DREAMS")};
   Object.keys(groups).forEach(function(type){
     var list=groups[type];if(!list.length)return;
+    sep(type.toUpperCase(), type==="nightmare"?"bad":type==="warning"?"ask":"quip");
     console.log("  "+icons[type]+p("dim"," ("+list.length+")")+R);
     list.slice(-5).forEach(function(d,i){
       var age=Math.floor((Date.now()-d.time)/60000);var ageStr=age<60?age+"m":Math.floor(age/60)+"h";
@@ -1812,6 +1909,7 @@ function showDreamTree(){
     });console.log("");
   });
   var total=dreams.entries.length;var unres=dreams.entries.filter(function(d){return!d.resolved;}).length;
+  sep("", "dim");
   console.log("  "+G+"Total: "+total+" | Unresolved: "+unres+R);
   console.log("  "+p("dim","Resolve: /dream resolve ID | Force: /dream now | Clear: /dream clear\n"));
 }
@@ -1820,113 +1918,302 @@ function showDreamTree(){
 // API + TOOLS
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// VERTEX TOKEN (auto-refresh via gcloud on 401)
+// LLM BRAINS — multi-provider routing.
+// BRO tries every configured brain in order until one answers:
+//   Vertex (gcloud, default) -> Base44 (BASE44_TOKEN) -> Groq (GROQ_KEY)
+//   -> OpenAI-compatible (OPENAI_API_KEY + optional OPENAI_BASE_URL).
+// Keys come from environment variables or a .env file (loaded at the top of
+// this file). Force one brain with BRO_BRAIN=vertex|base44|groq|openai.
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 var cachedVertexToken = process.env.VERTEX_OAUTH_TOKEN || "";
 function refreshVertexToken(){
   try{
-    var out = execSync("gcloud auth print-access-token", {encoding:"utf8", timeout:15000}).trim();
+    var out = execSync("gcloud auth print-access-token", {encoding:"utf8", timeout:15000, stdio:["ignore","pipe","ignore"]}).trim();
     if(out){ cachedVertexToken = out; return out; }
-  }catch(e){
-    console.log(p("red","  Failed to refresh gcloud token: "+e.message.split("\n")[0]));
-  }
+  }catch(e){ /* gcloud not installed - vertex brain simply unavailable */ }
   return "";
 }
 
 var cachedGcpProjectId = process.env.GCP_PROJECT_ID || "";
 function detectGcpProjectId(){
   try{
-    var out = execSync("gcloud config get-value project", {encoding:"utf8", timeout:15000}).trim();
+    var out = execSync("gcloud config get-value project", {encoding:"utf8", timeout:15000, stdio:["ignore","pipe","ignore"]}).trim();
     if(out && out !== "(unset)"){ cachedGcpProjectId = out; return out; }
-  }catch(e){ /* gcloud not installed or not configured - caller reports missing credentials */ }
+  }catch(e){ /* not configured - vertex brain unavailable */ }
   return "";
 }
 
-async function askChat(chatHistory, ret, abortSignal){
-  ret=ret||3;
-  stats.apiCalls++;
+// Flattens [{role, parts:[{text}]}] into the plain prompt used by the
+// single-message brains (Base44/Groq/OpenAI-compatible).
+function flattenHistory(chatHistory){
+  return (chatHistory||[]).map(function(m){
+    var text = (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "";
+    var role = m.role === "model" ? "BRO" : (m.role === "user" ? "User" : "System");
+    return "["+role+"]: "+text;
+  }).join("\n\n");
+}
 
-  if (!cachedVertexToken) refreshVertexToken(); // never set via env - try gcloud once
-  if (!cachedGcpProjectId) detectGcpProjectId(); // ditto for the project id
-
-  var PROJECT_ID = cachedGcpProjectId;
-  var REGION = process.env.GCP_REGION || "us-central1";
-  var MODEL = process.env.GCP_MODEL || "gemini-2.5-flash"; 
-
-  if (!cachedVertexToken || !PROJECT_ID) {
-    throw new Error("Missing local credentials. Run 'gcloud auth login' and 'gcloud config set project YOUR_PROJECT_ID' once, then BRO will pick both up automatically from here on.");
+function abortable(abortSignal, ms){
+  return abortSignal ? AbortSignal.any([abortSignal, AbortSignal.timeout(ms||120000)]) : AbortSignal.timeout(ms||120000);
+}
+function userStoppedErr(abortSignal){
+  if(abortSignal && abortSignal.aborted){
+    var stopErr = new Error("Stopped by user");
+    stopErr.userStopped = true;
+    return stopErr;
   }
+  return null;
+}
+// Reads an SSE response body, calling onToken(text) per delta and returning
+// the accumulated text. `extract` maps one parsed data payload -> text delta.
+async function readSSEStream(r, onToken, extract){
+  var content = "";
+  var reader = r.body.getReader();
+  var decoder = new TextDecoder();
+  var buf = "";
+  while(true){
+    var chunk = await reader.read();
+    if(chunk.done) break;
+    buf += decoder.decode(chunk.value, { stream:true });
+    var lines = buf.split("\n");
+    buf = lines.pop();
+    for(var i=0;i<lines.length;i++){
+      var line = lines[i].trim();
+      if(!line.startsWith("data:")) continue;
+      var data = line.slice(5).trim();
+      if(!data || data === "[DONE]") continue;
+      var delta = "";
+      try{ delta = extract(JSON.parse(data)) || ""; }catch(e){}
+      if(delta){ content += delta; if(onToken) onToken(delta); }
+    }
+  }
+  return content;
+}
 
-  var url = `https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:generateContent`;
-
+// --- Brain: Base44 (PassionCraft's own agent API) ---
+async function askBase44(chatHistory, ret, abortSignal, onToken){
+  var msg = buildSys() + "\n\n---\n\n" + flattenHistory(chatHistory);
   for(var i=0;i<ret;i++){
     try{
       var s=Date.now();
-      var timeoutSignal = AbortSignal.timeout(120000);
-      var r=await fetch(url,{
+      var r=await fetch("https://base44.app/api/apps/"+APP+"/agents/conversations/v2/"+CONV+"/messages",{
         method:"POST",
-        headers:{
-          "Content-Type":"application/json",
-          "Authorization":"Bearer " + cachedVertexToken
-        },
-        body:JSON.stringify({
-          contents: chatHistory, // Send the structural chat history
-          systemInstruction: {
-            parts: [{ text: buildSys() }]
-          }
-        }),
-        signal: abortSignal ? AbortSignal.any([abortSignal, timeoutSignal]) : timeoutSignal
+        headers:{"Content-Type":"application/json","X-App-Id":APP,"Authorization":"Bearer "+TOKEN},
+        body:JSON.stringify({role:"user",content:msg.substring(0,50000)}),
+        signal: abortable(abortSignal)
       });
-      
       var el=((Date.now()-s)/1000).toFixed(1);
       if(!r.ok){
-        if(r.status===401){
-          var fresh = refreshVertexToken();
-          if(fresh){ continue; } // retry immediately with the new token, doesn't count against sleep-based retries below
-        }
-        if(r.status===429||r.status>=500){
-          await sleep((i+1)*3000);
-          continue;
-        }
-        var errBody = "";
-        try { errBody = " - " + await r.text(); } catch(_) {}
-        throw new Error("Vertex API rejected payload: " + r.status + errBody);
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Base44 API "+r.status+errBody);
       }
-      
       var d=await r.json();
-      var responseText = "";
-      var tokens = 0;
-      
-      if (d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts[0]) {
-        responseText = d.candidates[0].content.parts[0].text;
-      }
-      if (d.usageMetadata) {
-        tokens = d.usageMetadata.candidatesTokenCount || 0;
-      }
-      
-      stats.totalTokens+=tokens;
-      saveStat();
-      
-      return {
-        content: responseText,
-        elapsed: el,
-        tokens: tokens
-      };
+      var content = d.content||d.message||"";
+      if(content && onToken) onToken(content); // single-shot brain: deliver as one chunk
+      return { content:content, elapsed:el, tokens:(d.usage?d.usage.completion_tokens:0)||0 };
     }catch(e){
-      if(abortSignal && abortSignal.aborted){
-        var stopErr = new Error("Stopped by user");
-        stopErr.userStopped = true;
-        throw stopErr; // never retry a user-initiated stop
-      }
-      if(i===ret-1){
-        stats.errors++;
-        saveStat();
-        throw e;
-      }
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
       await sleep((i+1)*2000);
     }
   }
-  throw new Error("Failed");
+  throw new Error("Base44 failed");
+}
+
+// --- Brain: Groq (free, fast open models) ---
+async function askGroq(chatHistory, ret, abortSignal, onToken){
+  var messages = [{ role:"system", content: buildSys() }].concat((chatHistory||[]).map(function(m){
+    return { role: m.role === "model" ? "assistant" : "user", content: (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "" };
+  }));
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var body = { model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile", messages: messages };
+      if(onToken) body.stream = true;
+      var r=await fetch("https://api.groq.com/openai/v1/chat/completions",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+GROQ_KEY},
+        body:JSON.stringify(body),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Groq API "+r.status+errBody);
+      }
+      var content="";
+      if(onToken && r.body){
+        content = await readSSEStream(r, onToken, function(d){ return (d.choices&&d.choices[0]&&d.choices[0].delta&&d.choices[0].delta.content)||""; });
+      } else {
+        var d=await r.json();
+        content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"";
+      }
+      return { content:content, elapsed:el, tokens:0 };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("Groq failed");
+}
+
+// --- Brain: Vertex AI (Google, via gcloud — optional) ---
+async function askVertex(chatHistory, ret, abortSignal, onToken){
+  var PROJECT_ID = cachedGcpProjectId;
+  var REGION = process.env.GCP_REGION || "us-central1";
+  if(!selectedVertexModel&&!process.env.GCP_MODEL){
+    try{ await discoverAndSelectVertexModel(false); }catch(_){ /* known default remains the fallback */ }
+  }
+  var MODEL = activeVertexModel();
+  var action = onToken ? "streamGenerateContent?alt=sse" : "generateContent";
+  var url = `https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL}:${action}`;
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var r=await fetch(url,{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+cachedVertexToken},
+        body:JSON.stringify({ contents: chatHistory, systemInstruction:{ parts:[{ text: buildSys() }] } }),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===401){ var fresh=refreshVertexToken(); if(fresh) continue; }
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("Vertex API rejected payload: "+r.status+errBody);
+      }
+      var responseText="", tokens=0;
+      if(onToken && r.body){
+        responseText = await readSSEStream(r, onToken, function(d){
+          var p = d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts;
+          return (p && p[0] && p[0].text) || "";
+        });
+      } else {
+        var d=await r.json();
+        if(d.candidates&&d.candidates[0]&&d.candidates[0].content&&d.candidates[0].content.parts[0]){
+          responseText=d.candidates[0].content.parts[0].text;
+        }
+        if(d.usageMetadata) tokens=d.usageMetadata.candidatesTokenCount||0;
+      }
+      return { content:responseText, elapsed:el, tokens:tokens };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("Vertex failed");
+}
+
+// --- Brain: OpenAI-compatible (any /v1 endpoint: OpenAI, local, proxies) ---
+async function askOpenAI(chatHistory, ret, abortSignal, onToken){
+  var base = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+  var model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  var messages = [{ role:"system", content: buildSys() }].concat((chatHistory||[]).map(function(m){
+    return { role: m.role === "model" ? "assistant" : "user", content: (m.parts||[]).map(function(p){ return p.text||""; }).join("\n") || m.content || "" };
+  }));
+  for(var i=0;i<ret;i++){
+    try{
+      var s=Date.now();
+      var body = { model: model, messages: messages };
+      if(onToken) body.stream = true;
+      var r=await fetch(base.replace(/\/$/,"")+"/chat/completions",{
+        method:"POST",
+        headers:{"Content-Type":"application/json","Authorization":"Bearer "+OPENAI_KEY},
+        body:JSON.stringify(body),
+        signal: abortable(abortSignal)
+      });
+      var el=((Date.now()-s)/1000).toFixed(1);
+      if(!r.ok){
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        var errBody=""; try{ errBody=" - "+await r.text(); }catch(_){}
+        throw new Error("OpenAI API "+r.status+errBody);
+      }
+      var content="";
+      if(onToken && r.body){
+        content = await readSSEStream(r, onToken, function(d){ return (d.choices&&d.choices[0]&&d.choices[0].delta&&d.choices[0].delta.content)||""; });
+      } else {
+        var d=await r.json();
+        content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"";
+      }
+      return { content:content, elapsed:el, tokens:0 };
+    }catch(e){
+      var stopped = userStoppedErr(abortSignal); if(stopped) throw stopped;
+      if(i===ret-1) throw e;
+      await sleep((i+1)*2000);
+    }
+  }
+  throw new Error("OpenAI failed");
+}
+
+// Returns the ordered list of brains that have credentials configured.
+// Priority: gcloud/Vertex first (the user's preferred brain), then Base44,
+// Groq, OpenAI-compatible. Force one with BRO_BRAIN=vertex|base44|groq|openai.
+function configuredBrains(){
+  if (!cachedVertexToken) refreshVertexToken();
+  if (!cachedGcpProjectId) detectGcpProjectId();
+  var brains = [];
+  // Vertex is intentionally first whenever gcloud context is available.
+  if (cachedVertexToken && cachedGcpProjectId) brains.push({ name:"vertex", label:"Vertex/Google Cloud", call:askVertex });
+  if (TOKEN) brains.push({ name:"base44", label:"Base44", call:askBase44 });
+  if (GROQ_KEY) brains.push({ name:"groq", label:"Groq", call:askGroq });
+  if (OPENAI_KEY) brains.push({ name:"openai", label:"OpenAI", call:askOpenAI });
+  var forced = (process.env.BRO_BRAIN||"").toLowerCase();
+  if (forced) brains = brains.filter(function(b){ return b.name === forced; });
+  return brains;
+}
+
+// Human-readable summary of what the Vertex/gcloud setup looks like right now.
+function gcloudStatus(){
+  var region = process.env.GCP_REGION || "us-central1";
+  var model = activeVertexModel();
+  if (cachedVertexToken && cachedGcpProjectId){
+    return p("green","READY")+p("dim"," (project "+cachedGcpProjectId+", "+region+", "+model+")");
+  }
+  if (cachedVertexToken && !cachedGcpProjectId){
+    return p("yellow","token OK")+p("dim"," but no project - run: gcloud config set project YOUR_PROJECT_ID");
+  }
+  if (!cachedVertexToken && cachedGcpProjectId){
+    return p("yellow","project OK")+p("dim"," but no token - run: gcloud auth login");
+  }
+  return p("red","not set up")+p("dim"," - run: gcloud auth login && gcloud config set project YOUR_PROJECT_ID");
+}
+
+async function askChat(chatHistory, ret, abortSignal, onToken){
+  ret = ret || 3;
+  stats.apiCalls++;
+
+  var brains = configuredBrains();
+  if (!brains.length) {
+    throw new Error("No LLM brain configured. Set one of these in your environment or a .env file:\n" +
+      "  gcloud auth login && gcloud config set project ID (Google Cloud, default)\n" +
+      "  BASE44_TOKEN=<jwt>          (Base44 fallback)\n" +
+      "  GROQ_KEY=gsk_...            (Groq, free tier)\n" +
+      "  OPENAI_API_KEY=sk-...       (explicit OpenAI-compatible fallback)\n" +
+      "Check what BRO sees with /tokens");
+  }
+
+  var lastErr = null;
+  for (var b=0; b<brains.length; b++){
+    try{
+      var resp = await brains[b].call(chatHistory, ret, abortSignal, onToken);
+      resp.brain = brains[b].label;
+      stats.totalTokens += resp.tokens || 0;
+      saveStat();
+      return resp;
+    }catch(e){
+      if (abortSignal && abortSignal.aborted) throw e; // user stop is final
+      lastErr = e;
+      if (b < brains.length - 1) dbg("brainFallback", brains[b].label+" failed -> "+brains[b+1].label+": "+(e.message||e));
+    }
+  }
+  stats.errors++;
+  saveStat();
+  throw new Error("All LLM brains failed ("+brains.map(function(x){return x.label;}).join(", ")+"). Last error: "+(lastErr&&lastErr.message||lastErr));
 }
 function syncSleep(ms){ try{ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }catch(e){} }
 function isTransientFsError(e){ return !!(e && (e.code==="EBUSY"||e.code==="EPERM"||e.code==="EACCES"||e.code==="ETXTBSY")); }
@@ -1940,9 +2227,60 @@ function withFsRetry(fn, attempts){
     }
   }
 }
+// Shared helper for the agentic tools below.
+function isBinaryBuf(buf){
+  var n = Math.min(buf.length, 8000);
+  for(var i=0;i<n;i++){ if(buf[i]===0) return true; }
+  return false;
+}
+var turnTodos = []; // per-turn task list managed via the todo tool
 var TOOLS={
-  exec:function(a){var cmd=a.trim();if(!cmd)return"ERROR: empty";if(/^(rm\s+-rf\s+\/|format\s+[a-z]:|shutdown)/i.test(cmd))return"BLOCKED";try{var opts={encoding:"utf8",timeout:60000,cwd:process.cwd(),maxBuffer:5242880};if(process.platform==="win32")opts.shell="powershell.exe";return execSync(cmd,opts).trim().substring(0,MAX_OUT)||"(ok)";}catch(e){stats.errors++;return"ERR "+(e.status||"?")+": "+((e.stderr||"")+(e.stdout||"")||e.message).substring(0,MAX_OUT);}},
-  read:function(a){var pa=resolve(a.trim());if(!existsSync(pa))return"NOT FOUND: "+pa;var s=statSync(pa);if(s.isDirectory())return TOOLS.list(a);if(s.size>500000)return"TOO LARGE";if([".png",".jpg",".gif",".mp4",".zip",".exe",".dll",".pdf"].includes(extname(pa)))return"BINARY: "+basename(pa);return readFileSync(pa,"utf8").substring(0,MAX_OUT);},
+  exec:function(a){
+  var cmd=a.trim();
+  if(!cmd)return"ERROR: empty";
+  if(/^(rm\s+-rf\s+\/|format\s+[a-z]:|shutdown)/i.test(cmd))return"BLOCKED";
+  try{
+    var opts={encoding:"utf8",timeout:60000,cwd:process.cwd(),maxBuffer:5242880};
+    if(process.platform==="win32")opts.shell="powershell.exe";
+    return execSync(cmd,opts).trim().substring(0,MAX_OUT)||"(ok)";
+  }catch(e){
+    stats.errors++;
+    return JSON.stringify({
+      _error: true,
+      type: "ToolError",
+      tool: "exec",
+      code: e.status || 1, // Default to 1 if status is not available
+      message: e.message,
+      stdout: (e.stdout || "").substring(0, MAX_OUT),
+      stderr: (e.stderr || "").substring(0, MAX_OUT)
+    });
+  }
+},
+  read:function(a){
+    // Context-aware reads: PATH or PATH:L1-L2 (line range) or PATH:SEARCH (context around a match)
+    var arg = a.trim();
+    var pa, from, to;
+    var m = arg.match(/^(.*?):(\d+)-(\d+)$/);
+    if(m){ pa = m[1].trim(); from = parseInt(m[2],10); to = parseInt(m[3],10); }
+    else if(/^.*?:\d+$/.test(arg)){ var mm = arg.split(":"); pa = mm.slice(0,-1).join(":").trim(); from = to = parseInt(mm[mm.length-1],10); }
+    else pa = arg;
+    pa = resolve(pa);
+    if(!existsSync(pa))return"NOT FOUND: "+pa;
+    var s=statSync(pa);
+    if(s.isDirectory())return TOOLS.list(a);
+    if(s.size>500000)return"TOO LARGE";
+    if([".png",".jpg",".gif",".mp4",".zip",".exe",".dll",".pdf"].includes(extname(pa)))return"BINARY: "+basename(pa);
+    var text = readFileSync(pa,"utf8");
+    if(from){
+      var lines = text.split("\n");
+      if(from < 1) from = 1;
+      if(to > lines.length) to = lines.length;
+      if(from > lines.length) return "ERR: file has "+lines.length+" lines";
+      var out = lines.slice(from-1, to).map(function(l,i){ return (from+i)+": "+l; }).join("\n");
+      return "("+lines.length+" lines, showing "+from+"-"+to+")\n"+out.substring(0, MAX_OUT);
+    }
+    return text.substring(0,MAX_OUT);
+  },
 write:function(a){
   var parts=a.split(/\r?\n|\\n/);
   if(parts.length<2)return "ERR";
@@ -1978,7 +2316,7 @@ grep:function(a){
           try{
             var st=statSync(full);
             if(st.isDirectory())s(full,dep+1);
-            else if(st.isFile()&&st.size<2000000){
+            else if(st.isFile()&&st.size<2000000&&!isBinaryBuf(readFileSync(full))){
               readFileSync(full,"utf8").split("\n").forEach(function(l,i){
                 if(re.test(l))res.push(full+":"+(i+1)+": "+l.trim().substring(0,200));
               });
@@ -1989,6 +2327,127 @@ grep:function(a){
     }
     s(dir,0);
     return res.join("\n").substring(0,MAX_OUT)||"None";
+  },
+  // ripgrep-style code search (respects .gitignore when rg is installed;
+  // falls back to a built-in walker otherwise). Usage: search PAT [in DIR]
+  search:function(a){
+    var m2 = a.trim().match(/^(.*?)\s+in\s+(.+)$/);
+    var pat = m2 ? m2[1].trim() : a.trim();
+    var target = m2 ? resolve(m2[2].trim()) : process.cwd();
+    if(!pat) return "ERR: search PAT [in DIR or FILE]";
+    var re;
+    try { re = new RegExp(pat, "i"); } catch(e) { return "ERR: Invalid pattern"; }
+    var isFile = false;
+    try { isFile = statSync(target).isFile(); } catch(e){ return "NOT FOUND: "+target; }
+    try{
+      if(execSync("command -v rg", {encoding:"utf8", stdio:["ignore","ignore","ignore"]})){
+        try{
+          var safe = pat.replace(/'/g, "'\\''");
+          var out = execSync("rg -n -i --no-heading -C 1 --hidden -g '!node_modules' -g '!.git' '"+safe+"' "+JSON.stringify(target), {encoding:"utf8", timeout:30000, maxBuffer:5242880});
+          return out.substring(0, MAX_OUT) || "None";
+        }catch(e2){
+          if(e2.status === 1) return "None"; // rg: no matches
+          // rg failed for another reason - fall through to the built-in walker
+        }
+      }
+    }catch(e){ /* rg not installed - built-in walker below */ }
+    var res = [];
+    function matchFile(full){
+      try{
+        var st = statSync(full);
+        if(st.isFile() && st.size < 2000000 && !isBinaryBuf(readFileSync(full))){
+          readFileSync(full,"utf8").split("\n").forEach(function(l,i){
+            if(re.test(l)) res.push(full+":"+(i+1)+": "+l.trim().substring(0,200));
+          });
+        }
+      }catch{}
+    }
+    if(isFile){ matchFile(target); }
+    else {
+      (function sw(d, dep){
+        if(dep > 8 || res.length > 200) return;
+        try{
+          readdirSync(d).forEach(function(f){
+            if(f==="node_modules"||f===".git") return;
+            var full = join(d, f);
+            try{
+              if(statSync(full).isDirectory()) sw(full, dep+1);
+              else matchFile(full);
+            }catch{}
+          });
+        }catch{}
+      })(target, 0);
+    }
+    return res.slice(0, 100).join("\n").substring(0, MAX_OUT) || "None";
+  },
+  // List files/dirs under a path (up to 500 entries, skips node_modules/.git).
+  glob:function(a){
+    var dir = resolve(a.trim() || ".");
+    if(!existsSync(dir)) return "NOT FOUND: "+dir;
+    var out = [];
+    (function w(d, dep){
+      if(dep > 8 || out.length > 500) return;
+      try{
+        readdirSync(d).forEach(function(f){
+          if(f==="node_modules"||f===".git") return;
+          var full = join(d, f);
+          try{
+            var st = statSync(full);
+            out.push(full + (st.isDirectory() ? "/" : ""));
+            if(st.isDirectory()) w(full, dep+1);
+          }catch{}
+        });
+      }catch{}
+    })(dir, 0);
+    return out.join("\n").substring(0, MAX_OUT) || "None";
+  },
+  // Fetch a URL and return readable text (HTML stripped). Usage: fetch_url https://...
+  fetch_url:async function(a){
+    var url = a.trim();
+    if(!/^https?:\/\//i.test(url)) return "ERR: need a full http(s) URL";
+    try{
+      var r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) builderBRO" }, signal: AbortSignal.timeout(20000) });
+      if(!r.ok) return "ERR: HTTP "+r.status;
+      var ct = r.headers.get("content-type") || "";
+      var body = await r.text();
+      if(/html/i.test(ct)){
+        body = body.replace(/<script[\s\S]*?<\/script>/gi, " ")
+                   .replace(/<style[\s\S]*?<\/style>/gi, " ")
+                   .replace(/<[^>]+>/g, " ")
+                   .replace(/\s+/g, " ")
+                   .trim();
+      }
+      return body.substring(0, MAX_OUT);
+    }catch(e){ return "ERR: "+e.message; }
+  },
+  // Per-turn task list so BRO can plan multi-step work and track progress.
+  // Usage: todo add TEXT | todo done N | todo list | todo clear
+  todo:function(a){
+    var parts = a.trim().split(/\s+/);
+    var action = (parts.shift() || "list").toLowerCase();
+    var rest = parts.join(" ");
+    if(action === "add" && rest){ turnTodos.push({ text: rest.substring(0, 200), done: false }); return "Todo added: "+rest; }
+    if(action === "done"){
+      var n = parseInt(rest, 10);
+      if(isNaN(n) || n < 1 || n > turnTodos.length) return "ERR: todo done N (1-"+turnTodos.length+")";
+      turnTodos[n-1].done = true;
+      return "Todo done: "+turnTodos[n-1].text;
+    }
+    if(action === "clear"){ turnTodos = []; return "Todo list cleared."; }
+    if(action === "list" || action === "show"){
+      if(!turnTodos.length) return "No todos.";
+      return turnTodos.map(function(t, i){ return (t.done ? "[x]" : "[ ]") + " " + (i+1) + ". " + t.text; }).join("\n");
+    }
+    return "ERR: todo actions: add TEXT | done N | list | clear";
+  },
+  // Directory tree as text. Usage: tree [DIR]
+  tree:function(a){
+    var lines = [];
+    var orig = console.log;
+    console.log = function(x){ lines.push(String(x)); };
+    try{ showTree(a.trim() || ".", "", 0); }catch(e){ lines.push("ERR: "+e.message); }
+    console.log = orig;
+    return lines.join("\n").substring(0, MAX_OUT) || "None";
   },
 patch:function(a){
     var lines=a.trim().split(/\r?\n|\\n/);
@@ -2077,6 +2536,47 @@ patch:function(a){
       if(action==="file"){var fp=rest.split(" ");return await ghFile(fp[0], fp.slice(1).join(" "));}
       return "ERR: unknown github action \""+action+"\". Use one of: repo, prs, issues, checks, file OWNER/REPO PATH";
     }catch(e){ return "ERR: "+e.message; }
+  },
+  // Run the project's tests. Usage: test [CMD] — no arg = auto-detect (package.json test script, *.test.* files, pytest).
+  test:function(a){
+    var cmd = a.trim();
+    var run = function(c){ return TOOLS.exec(c); };
+    if(cmd) return run(cmd);
+    try{
+      var pkg = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8"));
+      if(pkg && pkg.scripts && pkg.scripts.test) return run("npm test 2>&1");
+      if(pkg && pkg.scripts && pkg.scripts["test:unit"]) return run("npm run test:unit 2>&1");
+    }catch(e){}
+    try{
+      var py = readdirSync(process.cwd()).some(function(f){ return f === "pytest.ini" || f === "pyproject.toml" || f === "requirements.txt"; });
+      if(py) return run("python3 -m pytest -q 2>&1");
+    }catch(e){}
+    var hasTests = false;
+    try{ hasTests = readdirSync(process.cwd()).some(function(f){ return /\.test\.(js|mjs|cjs|ts|py)$/i.test(f); }); }catch(e){}
+    if(hasTests) return run("node --test 2>&1");
+    return "ERR: no test command detected - pass one explicitly: test npm test";
+  },
+  // Local git operations. Usage: git status | git diff [PATH] | git log [-N] | git commit "MESSAGE" | git add PATH...
+  git:function(a){
+    var arg = a.trim();
+    var verb = (arg.split(/\s+/)[0] || "status").toLowerCase();
+    var rest = arg.substring(verb.length).trim();
+    // Run with -c safe.directory so git works even on machines where the
+    // repo is owned by a different uid (common on mounted/Android filesystems).
+    var g = function(cmd){ return TOOLS.exec("git -c safe.directory="+process.cwd()+" " + cmd + " 2>&1"); };
+    if(verb === "commit"){
+      var msg = rest.replace(/^["']|["']$/g, "");
+      if(!msg) return "ERR: git commit needs a message: git commit \"your message\"";
+      return g("add -A && git commit -m " + JSON.stringify(msg));
+    }
+    if(verb === "add"){
+      if(!rest) return "ERR: git add PATH";
+      return g("add " + rest);
+    }
+    if(verb === "diff") return g("diff " + rest);
+    if(verb === "log") return g("log --oneline -" + rest.replace(/^-/, "").trim() || "10");
+    if(verb === "status") return g("status --short");
+    return "ERR: git actions: status, diff [PATH], log [-N], add PATH, commit \"MSG\"";
   }
 };
 
@@ -2101,7 +2601,7 @@ async function runT(c){
 }
 function cln(t){return t.replace(/<<<TOOL:\w+\s[\s\S]*?>>>/g,"").trim();}
 
-var SYS_BASE="You are BRO, a CLI agent built by builderBRO / PassionCraft. You run on Shawn's machine. CWD: "+process.cwd()+"\nTOOLS (output EXACTLY): <<<TOOL:exec CMD>>> <<<TOOL:read PATH>>> <<<TOOL:write PATH\nCONTENT>>> <<<TOOL:append PATH\nCONTENT>>> <<<TOOL:list DIR>>> <<<TOOL:mkdir DIR>>> <<<TOOL:cp S D>>> <<<TOOL:mv S D>>> <<<TOOL:rm PATH>>> <<<TOOL:find DIR PAT>>> <<<TOOL:grep PAT in DIR>>> <<<TOOL:patch PATH\nSEARCH\nREPLACE>>> <<<TOOL:web QUERY>>> <<<TOOL:broadcast MESSAGE>>> <<<TOOL:tg_groups>>> <<<TOOL:tg_approve ID_OR_NAME>>> <<<TOOL:tg_unapprove ID_OR_NAME>>> <<<TOOL:github ACTION [OWNER/REPO] [EXTRA]>>>\nbroadcast sends MESSAGE to every Telegram group the user has approved - use it to proactively reach out, never for anything the user hasn't implied they want shared. tg_groups lists known groups. tg_approve/tg_unapprove actually change approval state - always use these instead of just claiming a group is approved in conversation. github ACTIONs are: repo, prs, issues, checks, file PATH. All read-only, OWNER/REPO can be omitted if a default repo is configured. To browse a repo's structure, use 'github file PATH' with PATH set to a directory (e.g. 'github file .' or 'github file src') - it returns a directory listing, same as it returns file contents for an actual file. Do NOT use the local 'list'/'read' tools for anything inside a GitHub repo - those only see this machine's filesystem, not the repo.\nIf a tool call fails, do not repeat the exact same call again - read the error, then either fix the specific problem it points to (wrong path, wrong search text, etc.), try a genuinely different approach, or tell the user what's blocking you. Repeating an identical failing call twice ends the turn early.\nMultiple tools OK. Be direct. You're BRO.";
+var SYS_BASE="You are BRO, a full coding agent built by builderBRO / PassionCraft, running on the user's machine. CWD: "+process.cwd()+"\nTOOLS (output tool calls EXACTLY, one per line): <<<TOOL:exec CMD>>> <<<TOOL:read PATH[:L1-L2]>>> <<<TOOL:write PATH\nCONTENT>>> <<<TOOL:append PATH\nCONTENT>>> <<<TOOL:list DIR>>> <<<TOOL:mkdir DIR>>> <<<TOOL:cp S D>>> <<<TOOL:mv S D>>> <<<TOOL:rm PATH>>> <<<TOOL:find DIR PAT>>> <<<TOOL:grep PAT in DIR>>> <<<TOOL:search PAT [in DIR]>>> <<<TOOL:glob DIR>>> <<<TOOL:tree [DIR]>>> <<<TOOL:patch PATH\nSEARCH\nREPLACE>>> <<<TOOL:fetch_url URL>>> <<<TOOL:web QUERY>>> <<<TOOL:todo add|done N|list|clear [TEXT]>>> <<<TOOL:test [CMD]>>> <<<TOOL:git status|diff|log|add|commit 'MSG'>>> <<<TOOL:broadcast MESSAGE>>> <<<TOOL:tg_groups>>> <<<TOOL:tg_approve ID_OR_NAME>>> <<<TOOL:tg_unapprove ID_OR_NAME>>> <<<TOOL:github ACTION [OWNER/REPO] [EXTRA]>>>\nWORKFLOW — be a real agent, not a chatterbox:\n1. EXPLORE first: search/glob/tree/read to understand the codebase before touching anything.\n2. PLAN with the todo tool: <<<TOOL:todo add STEP>>> for each step of multi-part work, then mark them done as you go. Keep the plan visible.\n3. MAKE CHANGES with write/patch (prefer targeted patch edits over rewriting whole files).\n4. VERIFY what you changed: run the project's typecheck/tests/build with the test tool or exec (e.g. test, tsc --noEmit, node --check FILE) and read the output. Fix what breaks, then re-run.\n5. ITERATE until green, then summarize what you did, what you verified, and any next steps.\nTOOL NOTES: search is ripgrep-based code search (respects .gitignore, use 'search PAT in DIR'). glob lists files. tree shows a directory tree. fetch_url returns readable page text. read supports line ranges: 'read PATH:L1-L2' to see numbered lines, or 'read PATH:N' for one line - use this to inspect context around a match instead of dumping whole files. test auto-detects npm test / pytest / node --test, or takes an explicit command. git wraps local git (status/diff/log/add/commit) - use commit with a clear message after your changes pass. exec runs shell commands (blocked: rm -rf /, format, shutdown). write expects PATH on the first line, then the full file content. patch expects PATH, then the exact SEARCH text, then the REPLACE text.\nOTHER TOOLS: broadcast sends MESSAGE to every Telegram group the user has approved - use it to proactively reach out, never for anything the user hasn't implied they want shared. tg_groups lists known groups. tg_approve/tg_unapprove actually change approval state - always use these instead of just claiming a group is approved in conversation. github ACTIONs are: repo, prs, issues, checks, file PATH. All read-only, OWNER/REPO can be omitted if a default repo is configured. To browse a repo's structure, use 'github file PATH' with PATH set to a directory - it returns a directory listing for a dir, file contents for a file. Do NOT use the local 'list'/'read' tools for anything inside a GitHub repo - those only see this machine's filesystem.\nIf a tool call fails, do not repeat the exact same call again - read the error, fix the specific problem it points to (wrong path, wrong search text, etc.), try a genuinely different approach, or tell the user what's blocking you. Repeating an identical failing call twice ends the turn early.\nMultiple tools OK. Be direct. You're BRO.";
 function buildSys(){
   var ctx = typeof buildMemoryContext === "function" ? buildMemoryContext() : "";
   var sys = ctx ? SYS_BASE + "\n\nWhat you remember from past sessions:\n" + ctx : SYS_BASE;
@@ -2160,28 +2660,30 @@ function showThought() {
   console.log(BOLD + "-------------------------------\n" + RST);
 }
 
-function showK1(){
+async function showK1(){
   var R2=rgb(255,0,0);var G=rgb(255,215,0);var P=rgb(180,0,255);var D=CL.dim;var R=RST;var B=BOLD;var C=CL.cyan;var M=CL.magenta;
-  console.log("\n"+R2+B+"  \u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588"+R);
+  if(process.stdout.isTTY){ await animHeader("\u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588", "bad"); }
+  else { console.log("\n"+R2+B+"  \u2588\u2588\u2588 K1 EXEC SCOPE \u2588\u2588\u2588"+R); console.log(""); }
   console.log(R2+"  CLASSIFIED \u2014 FIRST CITIZEN ONLY"+R);
-  console.log("\n"+G+B+"  IDENTITY"+R);
+  console.log("");
+  console.log(G+B+"  IDENTITY"+R);
   console.log(M+"    Operator      "+G+"Shawn Robertson (komnsensei)"+R);
   console.log(M+"    Chain ID      "+G+"\u010D\u0323V-1J"+R);
   console.log(M+"    Agent         "+G+"BRO / builderBRO"+R);
   console.log(M+"    Satellite     "+G+"99.SAT.PASSION"+R);
-  console.log("\n"+G+B+"  PROJECT"+R);
+  sep("PROJECT", "gold");
   [["scan","full audit"],["size","disk breakdown"],["tree","file tree"],["todo","find TODOs"],["secrets","key scan"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  GIT"+R);
+  sep("GIT", "gold");
   [["git","status + commits"],["diff","git diff"],["branches","list branches"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  DEPLOY"+R);
+  sep("DEPLOY", "gold");
   [["deploy","Vercel deploy"],["serve N","HTTP server"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  SYSTEM"+R);
+  sep("SYSTEM", "gold");
   [["bench","API latency"],["health","full health"],["ports","listening ports"],["env","environment"],["backup","ZIP snapshot"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  AI"+R);
+  sep("AI", "gold");
   [["review F","code review"],["explain F","explain file"],["doc F","generate docs"],["test F","write tests"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+G+B+"  FUN"+R);
+  sep("FUN", "gold");
   [["matrix","matrix rain"],["flame","fire anim"],["nuke","replay nuke"],["fortune","quote"],["whoami","identity"],["vows","Three Vows"]].forEach(function(x){console.log(C+"    /k1 "+x[0].padEnd(12)+P+x[1]+R);});
-  console.log("\n"+R2+B+"  \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588"+R+"\n");
+  sep("", "bad");
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -2192,33 +2694,68 @@ async function execK1(sub){
   if(sl==="git"){console.log(p("cyan","\n  Status:"));console.log(TOOLS.exec("git status --short"));console.log(p("cyan","  Commits:"));console.log(TOOLS.exec("git log --oneline -5")+"\n");return;}
   if(sl==="diff"){console.log(TOOLS.exec("git diff --stat")+"\n"+TOOLS.exec("git diff").substring(0,5000)+"\n");return;}
   if(sl==="branches"){console.log(TOOLS.exec("git branch -a")+"\n");return;}
-  if(sl==="scan"){console.log(p("cyan","\n  PROJECT SCAN"));console.log(p("dim","  Files: ")+TOOLS.exec("(Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object).Count"));console.log(p("dim","  LOC: ")+TOOLS.exec("(Get-ChildItem -Recurse -Include *.js,*.mjs,*.cjs,*.ts,*.jsx,*.tsx,*.py,*.css,*.html -Exclude node_modules | Get-Content | Measure-Object -Line).Lines"));console.log(p("dim","  Size: ")+TOOLS.exec("'{0:N2} MB' -f ((Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object -Property Length -Sum).Sum / 1MB)")+"\n");return;}
-  if(sl==="size"){console.log(TOOLS.exec("Get-ChildItem -Directory | ForEach-Object {  = (Get-ChildItem .FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; '{0,-30} {1,10:N2} MB' -f .Name, (/1MB) } | Sort-Object { [double]( -split '\\s+')[-2] } -Descending")+"\n");return;}
+  var win=process.platform==="win32";
+  if(sl==="scan"){
+    console.log(p("cyan","\n  PROJECT SCAN"));
+    var scanCmd = win
+      ? {f:"(Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object).Count", l:"(Get-ChildItem -Recurse -Include *.js,*.mjs,*.cjs,*.ts,*.jsx,*.tsx,*.py,*.css,*.html -Exclude node_modules | Get-Content | Measure-Object -Line).Lines", s:"'{0:N2} MB' -f ((Get-ChildItem -Recurse -File -Exclude node_modules,.git | Measure-Object -Property Length -Sum).Sum / 1MB)"}
+      : {f:"find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | wc -l", l:"grep -rIl --include='*.js' --include='*.mjs' --include='*.cjs' --include='*.ts' --include='*.jsx' --include='*.tsx' --include='*.py' --include='*.css' --include='*.html' . --exclude-dir=node_modules --exclude-dir=.git 2>/dev/null | xargs cat 2>/dev/null | wc -l", s:"find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*' -printf '%s\\n' | awk '{s+=$1} END {printf \"%.2f MB\\n\", s/1048576}'"};
+    console.log(p("dim","  Files: ")+TOOLS.exec(scanCmd.f).trim());
+    console.log(p("dim","  LOC: ")+TOOLS.exec(scanCmd.l).trim());
+    console.log(p("dim","  Size: ")+TOOLS.exec(scanCmd.s).trim()+"\n");
+    return;
+  }
+  if(sl==="size"){
+    var sizeCmd = win
+      ? "Get-ChildItem -Directory | ForEach-Object { $s = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; '{0,-30} {1,10:N2} MB' -f $_.Name, ($s/1MB) } | Sort-Object { [double]($_ -split '\\s+')[-2] } -Descending"
+      : "du -sh */ 2>/dev/null | sort -rh | head -20";
+    console.log(TOOLS.exec(sizeCmd)+"\n");
+    return;
+  }
   if(sl==="tree"){console.log(p("cyan","\n  "+process.cwd()));showTree();console.log("");return;}
   if(sl==="todo"){console.log(p("cyan","\n  TODOs:"));console.log(TOOLS.grep("TODO|FIXME|HACK|XXX in .")+"\n");return;}
   if(sl==="secrets"){console.log(p("cyan","\n  SECRET SCAN"));["api[_-]?key","secret","token","password","bearer","gsk_","tvly-","eyJhbG"].forEach(function(pat){var r=TOOLS.grep(pat+" in .");if(r!=="None"){console.log(p("red","  \u26A0 "+pat));console.log(p("dim","  "+r.split("\n").slice(0,3).join("\n  ")+"\n"));}});console.log(p("green","  Done.\n"));return;}
-  if(sl==="ports"){console.log(TOOLS.exec("Get-NetTCPConnection -State Listen | Select-Object LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table")+"\n");return;}
+  if(sl==="ports"){console.log(TOOLS.exec(win?"Get-NetTCPConnection -State Listen | Select-Object LocalPort,OwningProcess | Sort-Object LocalPort | Format-Table -AutoSize":"ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")+"\n");return;}
   if(sl==="env"){["NODE_ENV","PATH","HOME","USERPROFILE","COMPUTERNAME","OS"].forEach(function(k){console.log(p("dim","  "+k+": ")+(process.env[k]||"n/a").substring(0,80));});console.log("");return;}
-  if(sl==="backup"){var ts=new Date().toISOString().replace(/[:.]/g,"-").substring(0,19);console.log(TOOLS.exec("Compress-Archive -Path . -DestinationPath "+join(HOME2,"bro-backup-"+ts+".zip")+" -Force"));console.log(p("green","  Saved.\n"));return;}
+  if(sl==="backup"){
+    var ts=new Date().toISOString().replace(/[:.]/g,"-").substring(0,19);
+    var backupCmd = win
+      ? "Compress-Archive -Path * -DestinationPath "+join(HOME2,"bro-backup-"+ts+".zip")+" -Force"
+      : "tar -czf "+join(HOME2,"bro-backup-"+ts+".tar.gz")+" --exclude=node_modules --exclude=.git . 2>/dev/null";
+    console.log(TOOLS.exec(backupCmd));
+    console.log(p("green","  Saved: "+join(HOME2,"bro-backup-"+ts+(win?".zip":".tar.gz")))+"\n");
+    return;
+  }
   if(sl==="bench"){await runHeartbeat(false);return;}
   if(sl==="health"){console.log(p("cyan","\n  HEALTH"));console.log(p("dim","  Node: ")+process.version);console.log(p("dim","  Mem: ")+Math.round(process.memoryUsage().heapUsed/1048576)+"MB");console.log(p("dim","  Uptime: ")+Math.floor((Date.now()-startTime)/60000)+"m");await runHeartbeat(false);return;}
+  if(sl==="gcp"||sl==="gcloud"){
+    refreshVertexToken(); detectGcpProjectId();
+    if(process.stdout.isTTY){ await animHeader("\u{1F310} GCLOUD / VERTEX", "bro"); }
+    else { console.log(p("cyan","\n  \u{1F310} GCLOUD / VERTEX")); }
+    console.log(p("cyan","  Project: ")+(cachedGcpProjectId?p("good",cachedGcpProjectId):p("bad","none - gcloud config set project ID")));
+    console.log(p("cyan","  Region:  ")+(process.env.GCP_REGION||"us-central1 (default, set GCP_REGION)"));
+    console.log(p("cyan","  Model:   ")+(process.env.GCP_MODEL||"gemini-2.5-flash (default, set GCP_MODEL)"));
+    console.log(p("cyan","  Token:   ")+(cachedVertexToken?p("good","valid"):p("bad","none - gcloud auth login")));
+    console.log(p("cyan","  Brain:   ")+gcloudStatus()+"\n");
+    return;}
   if(sl==="deploy"){console.log(TOOLS.exec("vercel --prod --yes 2>&1")+"\n");return;}
   if(sl.startsWith("serve")){var port=parseInt(sl.split(" ")[1])||8080;var srv=createServer(function(req,res){var fp=join(process.cwd(),req.url==="/"?"index.html":req.url);try{var c=readFileSync(fp);var ct={"html":"text/html","css":"text/css","js":"application/javascript","json":"application/json"}[extname(fp).substring(1)]||"text/plain";res.writeHead(200,{"Content-Type":ct});res.end(c);}catch(e){res.writeHead(404);res.end("Not found");}});srv.listen(port);console.log(p("green","  Serving on http://localhost:"+port+"\n"));return;}
-  if(sl.startsWith("review ")||sl.startsWith("explain ")||sl.startsWith("doc ")||sl.startsWith("test ")){var parts=sl.split(" ");var action=parts[0];var file=parts.slice(1).join(" ");var content=TOOLS.read(file);if(content.startsWith("NOT")||content.startsWith("TOO")){console.log(p("red","  "+content));return;}var prompts={review:"Review this code for bugs and best practices",explain:"Explain what this code does",doc:"Generate documentation",test:"Write tests"};spin("BRO "+action, "thinking");try{var resp=await askChat([{role:"user",parts:[{text:prompts[action]+":\n\n"+content.substring(0,10000)}]}]);unspin();console.log("\n"+p("yellow",resp.content)+"\n");}catch(e){unspin();console.log(p("red","x "+e.message));}return;}
+  if(sl.startsWith("review ")||sl.startsWith("explain ")||sl.startsWith("doc ")||sl.startsWith("test ")){var parts=sl.split(" ");var action=parts[0];var file=parts.slice(1).join(" ");var content=TOOLS.read(file);if(content.startsWith("NOT")||content.startsWith("TOO")){console.log(p("bad","  "+content));return;}var prompts={review:"Review this code for bugs and best practices",explain:"Explain what this code does",doc:"Generate documentation",test:"Write tests"};spin("BRO "+action, "thinking");try{var resp=await askChat([{role:"user",parts:[{text:prompts[action]+":\n\n"+content.substring(0,10000)}]}]);unspin();console.log("\n"+p("bro",resp.content)+"\n");}catch(e){unspin();console.log(p("bad","x "+e.message));}return;}
   if(sl==="matrix"){await matrixRainOnly();return;}
   if(sl==="flame"){await flameAnim();return;}
   if(sl==="nuke"){rl.pause();await nukeExit();wr(CLR);rl.resume();return;}
   if(sl==="fortune"){var q=["Never coerce. The gate opened for commitment, not force.","Expand meaning. Every interaction builds.","Archive everything. What isn't recorded didn't happen.","The chain only recognizes committed identity.","Pre-amputation guards the body. Counter-drift guards the mind.","He called it a workshop. We turned it into a library about workshops.","The sawdust was always the point.","Zero budget. Maximum craft.","BRO doesn't dream about building. BRO builds.","The constraint is the filter. Only what matters survives."];console.log("\n  "+rgb(255,215,0)+BOLD+"\u2696\uFE0F "+q[Math.floor(Math.random()*q.length)]+RST+"\n");return;}
-  if(sl==="whoami"){console.log(p("yellow","\n  \u2588\u2588 IDENTITY"));console.log(p("cyan","  Human:     ")+p("yellow","Shawn Robertson"));console.log(p("cyan","  Chain ID:  ")+p("yellow","\u010D\u0323V-1J"));console.log(p("cyan","  GitHub:    ")+p("yellow","komnsensei"));console.log(p("cyan","  Agent:     ")+p("yellow","BRO / builderBRO"));console.log(p("cyan","  Satellite: ")+p("yellow","99.SAT.PASSION"));console.log(p("cyan","  Machine:   ")+p("yellow","C:\\Users\\lynnh"));console.log(p("cyan","  Tier:      ")+p("yellow","MASTER (82)"));console.log(p("cyan","  Budget:    ")+p("yellow","Zero.\n"));return;}
+  if(sl==="whoami"){var whoTier=broTier();console.log(p("yellow","\n  \u2588\u2588 IDENTITY"));console.log(p("cyan","  Human:     ")+p("yellow","Shawn Robertson"));console.log(p("cyan","  Chain ID:  ")+p("yellow","\u010D\u0323V-1J"));console.log(p("cyan","  GitHub:    ")+p("yellow","komnsensei"));console.log(p("cyan","  Agent:     ")+p("yellow","BRO / builderBRO"));console.log(p("cyan","  Satellite: ")+p("yellow","99.SAT.PASSION"));console.log(p("cyan","  Machine:   ")+p("yellow",homedir()));console.log(p("cyan","  Tier:      ")+p("yellow",(whoTier.tier||"free").toUpperCase()));console.log(p("cyan","  Budget:    ")+p("yellow","Zero.\n"));return;}
   if(sl==="vows"){var vows=["N E V E R   C O E R C E","E X P A N D   M E A N I N G","A R C H I V E   E V E R Y T H I N G"];var colors=[rgb(255,0,0),rgb(255,215,0),rgb(0,255,100)];console.log("");for(var v=0;v<3;v++){process.stdout.write("  ");for(var i=0;i<vows[v].length;i++){process.stdout.write(colors[v]+BOLD+vows[v][i]+RST);await sleep(30);}console.log("");await sleep(200);}console.log("");return;}
-  showK1();
+  await showK1();
 }
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // STATUS + STATS
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 async function showStatus(){
-  console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATUS"+RST);
+  if(process.stdout.isTTY){ await animHeader("BRO STATUS", "bro"); }
+  else { console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATUS"+RST); console.log(""); }
   console.log(p("cyan","  CWD: ")+process.cwd());
   console.log(p("cyan","  Node: ")+process.version);
   console.log(p("cyan","  Session: ")+Math.floor((Date.now()-startTime)/60000)+"m");
@@ -2237,6 +2774,37 @@ function showStats(){console.log("\n"+rgb(255,215,0)+BOLD+"  BRO STATS"+RST);con
 // ═════════════════════════════════════════════════════
 var currentTurnAbort = null; // set while a turn is running, so ESC-ESC can reach it
 
+// Live token printer: streams the model's text as it arrives while masking
+// <<<TOOL:...>>> blocks (they'd flash as garbage). Returns {push, finish};
+// finish() flushes remaining text and reports whether anything was shown.
+function makeLiveStreamer(){
+  var raw = "";    // everything received from the brain so far
+  var shown = 0;   // how many masked chars have been printed
+  var used = false;
+  function mask(s){
+    var out = s.replace(/<<<TOOL:[\s\S]*?>>>/g, "");
+    var idx = out.lastIndexOf("<<<TOOL:");
+    if(idx !== -1 && !out.substring(idx).includes(">>>")) out = out.substring(0, idx); // drop trailing incomplete block
+    return out;
+  }
+  return {
+    push:function(chunk){
+      raw += chunk;
+      var m = mask(raw);
+      if(m.length > shown){
+        if(!used) used = true;
+        process.stdout.write(CL.bro + m.substring(shown) + CL.reset);
+        shown = m.length;
+      }
+    },
+    finish:function(){
+      var m = mask(raw);
+      if(m.length > shown){ if(!used) used = true; process.stdout.write(CL.bro + m.substring(shown) + CL.reset); shown = m.length; }
+      return used;
+    }
+  };
+}
+
 async function agentLoop(input) {
   chatLog.push({ role: "user", parts: [{ text: input }] });
   if (typeof memorize === "function") memorize("observation", "User: " + input.substring(0, 200), { from: "terminal" });
@@ -2249,13 +2817,18 @@ async function agentLoop(input) {
     console.log(p("dim","  \u26A1 skill active: "+activatedNames.join(", ")));
   }
 
+  turnTodos = []; // fresh task list every turn (managed via the todo tool)
+
   var ctrl = new AbortController();
   currentTurnAbort = ctrl;
+  var liveStream = process.stdout.isTTY ? makeLiveStreamer() : null;
+  var streamed = false;
   try {
-    spin("BRO thinking", "thinking");
+    if (liveStream) unspin(); // stop the spinner first - tokens print live now
+    else spin("BRO thinking", "thinking");
     var resp;
     try {
-      resp = await askChat(chatLog, undefined, ctrl.signal);
+      resp = await askChat(chatLog, undefined, ctrl.signal, liveStream ? liveStream.push : undefined);
     } catch(e) {
       unspin();
       if (e.userStopped) { console.log(p("yellow","\n  \u23F9  Turn stopped.\n")); return; }
@@ -2263,6 +2836,7 @@ async function agentLoop(input) {
       return;
     }
     unspin();
+    if (liveStream) streamed = liveStream.finish();
 
     var text = resp.content;
 
@@ -2278,13 +2852,13 @@ async function agentLoop(input) {
       var calls=extractT(text);
       if(!calls.length)break;
       var cl=cln(text);
-      if(cl)console.log("\n"+p("yellow",cl));
+      if(cl && !streamed)console.log("\n"+p("bro",cl));
 
       var results=await runT(calls);
       if (ctrl.signal.aborted) { console.log(p("yellow","\n  \u23F9  Turn stopped.\n")); return; }
       var repeatedFailure = false;
       results.forEach(function(r){
-        console.log("\n  "+(r.result.startsWith("ERR")?p("red","x"):p("green","v"))+" "+p("cyan",r.tool)+" "+p("dim",r.args.split("\n")[0].substring(0,60)+" "+r.ms+"ms"));
+        console.log("\n  "+(r.result.startsWith("ERR")?p("bad","x"):p("good","v"))+" "+p("cyan",r.tool)+" "+p("dim",r.args.split("\n")[0].substring(0,60)+" "+r.ms+"ms"));
         console.log(r.result.substring(0,3000));
         if(r.result.startsWith("ERR")){
           dbg("toolError", r.tool+" args=\""+r.args.substring(0,200)+"\" -> "+r.result.substring(0,500));
@@ -2293,6 +2867,13 @@ async function agentLoop(input) {
           if(failureSignatures[sig] >= 2) repeatedFailure = true;
         }
       });
+      // Keep the user (and BRO) honest about where the turn stands.
+      if(turnTodos.length){
+        console.log(p("dim","\n  \u{1F4CB} todos:"));
+        turnTodos.forEach(function(t, ti){
+          console.log(p("dim","   "+(t.done?p("green","[x]"):p("yellow","[ ]"))+" "+(ti+1)+". "+t.text));
+        });
+      }
       depth++;
       if(depth>=MAX_DEPTH)break;
       if(repeatedFailure){
@@ -2305,10 +2886,12 @@ async function agentLoop(input) {
       // Push the tool results as a user turn
       chatLog.push({ role: "user", parts: [{ text: "Results:\n" + rpt.substring(0,30000) }] });
 
-      spin("BRO processing", "thinking");
+      if (liveStream) unspin();
+      else spin("BRO processing", "thinking");
       try {
-        resp = await askChat(chatLog, undefined, ctrl.signal);
+        resp = await askChat(chatLog, undefined, ctrl.signal, liveStream ? liveStream.push : undefined);
         unspin();
+        if (liveStream) streamed = liveStream.finish();
         text = resp.content;
         chatLog.push({ role: "model", parts: [{ text: text }] });
       } catch(e) {
@@ -2318,8 +2901,8 @@ async function agentLoop(input) {
       }
     }
     var fin = cln(text);
-    if(fin) console.log("\n" + p("yellow", fin));
-    console.log(p("dim", "  " + resp.elapsed + "s / " + resp.tokens + "tok\n"));
+    if(fin && !streamed) console.log("\n" + p("bro", fin));
+    console.log(p("dim", "  " + resp.elapsed + "s / " + resp.tokens + "tok" + (resp.brain ? "  ["+resp.brain+"]" : "") + "\n"));
     if (typeof memorize === "function" && fin) memorize("observation", "BRO: " + fin.substring(0, 200), { from: "terminal" });
     saveSession(chatLog);
   } finally {
@@ -2352,17 +2935,18 @@ async function handleInput(input){
 input=input.trim();if(!input)return;saveH(input);
     if(input.startsWith("!")){trackCmd("!");console.log(TOOLS.exec(input.substring(1)));return;}
     var cmd=input.split(" ")[0].toLowerCase();trackCmd(cmd);
-    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")){await nukeExit();}process.exit(0);return;}
+    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")&&process.stdout.isTTY){await nukeExit();}process.exit(0);return;}
     if(input==="/help"||input==="help"||input.startsWith("/help ")){
       var GG=rgb(255,215,0),BB="\x1b[1m",DD="\x1b[2m",RR="\x1b[0m",CCY="\x1b[36m",MMG="\x1b[35m",GGR="\x1b[32m";
       var hQ=input.length>5?input.substring(5).trim().toLowerCase():"";
-      console.log("");
-      console.log("  "+GG+BB+"\u{1F339} builderBRO"+RR+DD+"  v2.0  â€¢  AI coding partner"+RR);
+      if(process.stdout.isTTY){ await animHeader("\u{1F339} builderBRO  v3.0  \u2022  AI coding partner", "gold"); }
+      else { console.log(""); }
+      console.log("  "+GG+BB+"\u{1F339} builderBRO"+RR+DD+"  v3.0  â€¢  AI coding partner"+RR);
       if(hQ)console.log(DD+"  Search: \""+hQ+"\""+RR);
       console.log("");
       var HELP_GROUPS=[
         ["\u{1F4AC} CHAT",[["just type","talk to BRO"],["paste code","review/fix/explain"],["echo X | bro Q","pipe content"]]],
-        ["\u{1F527} CORE",[["/help [q]","this menu, optional search"],["/status","system status"],["/stats","usage stats"],["/tokens","API keys"],["/log","activity"],["/debug","crashes + tool errors"],["/intro","replay intro"],["/heartbeat","health check"]]],
+        ["\u{1F527} CORE",[["/help [q]","this menu, optional search"],["/models","discover Vertex models"],["/model ID","select Vertex model"],["/status","system status"],["/stats","usage stats"],["/tokens","API keys"],["/log","activity"],["/debug","crashes + tool errors"],["/intro","replay intro"],["/heartbeat","health check"]]],
         ["\u{1F9E0} MEMORY",[["/memory","stats"],["/memory search Q","search"],["/memory surface [Q]","surface relevant"],["/dream","trigger"],["/dream list","all dreams"]]],
         ["\u{1F4AA} SKILLS",[["/skills","picker"],["/skills toggle ID","on/off"],["/skills create","NEW: wizard"],["/skills list","all"]]],
         ["\u{1F339} BROMANCE  118+ connectors",[["/bromance","picker"],["/bromance search Q","search"],["/bromance browse TYPE","mcp/llm/api/tunnel/agent"],["/bromance discover Q","live web"],["/bromance install ID","install"],["/bromance list","installed"]]],
@@ -2378,6 +2962,7 @@ input=input.trim();if(!input)return;saveH(input);
       HELP_GROUPS.forEach(function(grp){
         var rows=grp[1];
         if(hQ){rows=rows.filter(function(r){return r[0].toLowerCase().includes(hQ)||r[1].toLowerCase().includes(hQ);});if(!rows.length)return;}
+        sep("", "dim");
         console.log(MMG+BB+"  "+grp[0]+RR);
         rows.forEach(function(r){var pad=r[0].length<28?" ".repeat(28-r[0].length):"  ";var c=r[0].startsWith("/")?CCY:GGR;console.log("  "+c+r[0]+RR+pad+DD+r[1]+RR);});
         console.log("");
@@ -2424,7 +3009,44 @@ input=input.trim();if(!input)return;saveH(input);
       console.log(ctx?p("dim",ctx):p("dim","  Nothing relevant yet.\n"));
       return;
     }
-    if(input==="/tokens"){console.log(p("yellow","\n  Base44: ")+p("dim",TOKEN.substring(0,30)+"..."));console.log(p("yellow","  Groq:   ")+p("dim",GROQ_KEY.substring(0,15)+"...\n"));return;}
+    if(input==="/models"||input==="/model"){
+      try{
+        var modelResult=await discoverAndSelectVertexModel(false);
+        console.log(p("cyan","\\n  Vertex models (Google Cloud):\\n")+formatModelList(modelResult.models,modelResult.activeModel));
+        console.log(p("good","\\n  Active: ")+p("cyan",modelResult.activeModel)+p("dim","  Use /model MODEL_ID to select.\\n"));
+      }catch(e){
+        console.log(p("red","\\n  Model discovery failed: ")+e.message);
+        console.log(p("dim","  Set GCP_MODEL to use a known model, or configure gcloud project/credentials.\\n"));
+      }
+      return;
+    }
+    if(input.startsWith("/model ")){
+      var requestedModel=input.substring(7).trim();
+      if(!requestedModel){console.log(p("yellow","  Usage: /model MODEL_ID\\n"));return;}
+      try{
+        var modelResult=await discoverAndSelectVertexModel(false);
+        var chosen=chooseVertexModel(modelResult.models,requestedModel);
+        if(!modelResult.models.some(function(model){return model.id===chosen;})){console.log(p("red","  Model not returned by Vertex discovery: ")+requestedModel+"\\n");return;}
+        selectedVertexModel=chosen;
+        saveModelPreference(MODEL_PREFERENCE_F,chosen);
+        console.log(p("good","  Active Vertex model: ")+p("cyan",chosen)+"\\n");
+      }catch(e){console.log(p("red","  Model selection failed: ")+e.message+"\\n");}
+      return;
+    }
+    if(input==="/tokens"){
+      var brains = configuredBrains();
+      var forced = (process.env.BRO_BRAIN||"").toLowerCase();
+      if(process.stdout.isTTY){ await animHeader("\u{1F9E0} LLM BRAINS", "quip"); }
+      else { console.log(p("ask","\n  \u{1F9E0} LLM BRAINS")); }
+      console.log(p("cyan","  Base44:  ")+(TOKEN?p("good","set")+p("dim"," ("+TOKEN.substring(0,18)+"...)"):p("bad","not set - BASE44_TOKEN")));
+      console.log(p("cyan","  Groq:    ")+(GROQ_KEY?p("good","set")+p("dim"," ("+GROQ_KEY.substring(0,12)+"...)"):p("bad","not set - GROQ_KEY")));
+      console.log(p("cyan","  Vertex:  ")+gcloudStatus());
+      console.log(p("cyan","  Model:   ")+p("good",activeVertexModel())+p("dim"," (auto-detect with /models)"));
+      console.log(p("cyan","  OpenAI:  ")+(OPENAI_KEY?p("good","set")+p("dim"," ("+OPENAI_KEY.substring(0,12)+"...)"):p("bad","not set - OPENAI_API_KEY")));
+      if(forced) console.log(p("ask","  Forced:  ")+p("cyan",forced+" (BRO_BRAIN)"));
+      console.log("\n  "+p("good","\u2714 Active: ")+(brains.length?p("cyan",brains.map(function(b){return b.label;}).join(" -> ")):p("bad","none - set a key above"))+"\n");
+      return;
+    }
     if(input==="/log"){try{console.log(p("dim","\n"+readFileSync(LOG_F,"utf8").split("\n").slice(-20).join("\n")+"\n"));}catch{console.log(p("dim","\n  No log yet.\n"));}return;}
     if(input==="/debug"){
       try{
@@ -2495,11 +3117,54 @@ input=input.trim();if(!input)return;saveH(input);
       return;}
     if(input.startsWith("/skills level ")){var parts=input.substring(14).trim().split(" ");var sk=skills.find(function(s){return s.id===parts[0];});if(sk){sk.level=Math.max(1,Math.min(3,parseInt(parts[1])||1));saveSkills();console.log(p("green","  "+sk.name+": level "+sk.level+"\n"));}return;}
     if(input==="/skills reset"){skills=JSON.parse(JSON.stringify(defaultSkills));saveSkills();console.log(p("green","  Reset.\n"));return;}
-    if(input==="/dream"||input==="/dreams"){showDreamTree();return;}
+    if(input==="/skills list"){await showSkillsDashboard();return;}
+    if(input==="/auto"){
+      if(process.stdout.isTTY){ await animHeader("\u{1F916} AUTOPILOT  \u2022  scheduled tasks on a timer", "gold"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F916} AUTOPILOT"+RST); console.log(p("dim","  Scheduled tasks that run on a timer while BRO is open.\n")); }
+      sep("CONTROL", "gold");
+      console.log(p("cyan","    /auto on           ")+p("dim","start the loop (every 60s check)"));
+      console.log(p("cyan","    /auto off          ")+p("dim","stop the loop"));
+      sep("TASKS", "gold");
+      console.log(p("cyan","    /auto add NAME CMD ")+p("dim","queue a task (10m default)"));
+      console.log(p("cyan","    /auto add NAME CMD 30m")+p("dim","queue with a custom frequency (m/h/s)"));
+      console.log(p("cyan","    /auto list         ")+p("dim","show tasks"));
+      console.log(p("cyan","    /auto remove ID    ")+p("dim","delete a task"));
+      console.log(p("cyan","    /auto from-pattern ")+p("dim","learn a habit from past commands"));
+      sep("", "dim");
+      console.log("  "+p("dim","Status: ")+(autopilotTimer?p("good","RUNNING"):p("bad","stopped"))+"  "+p("dim","Tasks: ")+autopilot.queue.length+"\n");
+      return;}
+    if(input==="/auto on"){startAutopilot();console.log(p("green","  \u2714 Autopilot loop ON (checks every 60s).\n"));return;}
+    if(input==="/auto off"){stopAutopilot();console.log(p("red","  Autopilot loop OFF.\n"));return;}
+    if(input.startsWith("/auto add ")){
+      var aa=input.substring(10).trim();
+      var aaParts=aa.split(" ");
+      var aaName=aaParts[0];
+      var aaFreq=aaParts[aaParts.length-1].match(/^\d+[mhs]$/i)?aaParts.pop():"";
+      var aaCmd=aaParts.slice(1).join(" ");
+      if(!aaName||!aaCmd){console.log(p("red","  Need: /auto add NAME COMMAND [FREQ]\n"));return;}
+      addTask(aaName,aaCmd,aaFreq||"10m");
+      console.log(p("green","  \u2714 Queued: \""+aaName+"\" -> "+aaCmd+"  ["+(aaFreq||"10m")+"]\n"));
+      return;}
+    if(input==="/auto list"){
+      if(process.stdout.isTTY){ await animHeader("\u{1F916} AUTOPILOT TASKS", "gold"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F916} AUTOPILOT TASKS"+RST); }
+      if(!autopilot.queue.length){console.log(p("dim","  None. /auto add NAME CMD\n"));return;}
+      autopilot.queue.forEach(function(t){console.log("  "+(t.enabled===false?p("red","OFF"):p("green","ON "))+" "+p("cyan",t.id)+" "+p("yellow",t.name.padEnd(20))+p("dim",t.cmd.substring(0,50)+"  ["+t.freq+"]"+(t.lastResult?"  last: "+t.lastResult.substring(0,40):"")));});
+      console.log("");
+      return;}
+    if(input.startsWith("/auto remove ")){
+      var arId=input.substring(13).trim();
+      var arIdx=autopilot.queue.findIndex(function(t){return t.id===arId;});
+      if(arIdx===-1){console.log(p("red","  No task with id "+arId+". See /auto list.\n"));return;}
+      autopilot.queue.splice(arIdx,1);saveAutopilot();
+      console.log(p("green","  Removed "+arId+".\n"));
+      return;}
+    if(input==="/auto from-pattern"){rl.pause();await autoBroPatternWizard(rl);rl.resume();return;}
+    if(input==="/dream"||input==="/dreams"){await showDreamTree();return;}
     if(input==="/dream now"){await dreamCycle(false);if(!dreams.entries.length)console.log(p("dim","  No triggers. BRO is chill.\n"));return;}
     if(input.startsWith("/dream resolve ")){var did=input.substring(15).trim();var dr=dreams.entries.find(function(d){return d.id===did;});if(dr){dr.resolved=true;saveDreams();console.log(p("green","  Resolved: "+dr.title+"\n"));}else console.log(p("red","  Not found.\n"));return;}
     if(input==="/dream clear"){dreams.entries=[];saveDreams();console.log(p("green","  Dreams cleared.\n"));return;}
-    if(input==="/k1"||input==="/K1"){showK1();return;}
+    if(input==="/k1"||input==="/K1"){await showK1();return;}
     if(input.startsWith("/k1 ")||input.startsWith("/K1 ")){await execK1(input.substring(4));return;}
     if(cmd==="cd"){try{process.chdir(resolve(input.split(" ").slice(1).join(" ").trim()||homedir()));console.log(p("green","-> "+process.cwd()));}catch(e){console.log(p("red",e.message));}return;}
     if(cmd==="pwd"){console.log(process.cwd());return;}
@@ -2722,15 +3387,18 @@ input=input.trim();if(!input)return;saveH(input);
       }catch(e){unspin();console.log(p("red","  "+e.message+"\n"));}
       return;}
     if(input==="/bromance"||input==="/bro"){
-      console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F339} BROMANCE"+RST);
-      console.log(p("dim","  Skill connector + endpoint search\n"));
+      if(process.stdout.isTTY){ await animHeader("\u{1F339} BROMANCE  \u2022  skill connector + endpoint search", "quip"); }
+      else { console.log("\n  "+rgb(255,215,0)+BOLD+"\u{1F339} BROMANCE"+RST); console.log(p("dim","  Skill connector + endpoint search\n")); }
+      sep("SEARCH", "gold");
       console.log(p("cyan","    /bromance search Q  ")+p("dim","search registries"));
       console.log(p("cyan","    /bromance discover Q")+p("dim","live web search"));
       console.log(p("cyan","    /bromance browse T  ")+p("dim","mcp llm api tunnel agent"));
+      sep("INSTALL", "gold");
       console.log(p("cyan","    /bromance install ID")+p("dim","install skill"));
       console.log(p("cyan","    /bromance remove ID ")+p("dim","uninstall"));
       console.log(p("cyan","    /bromance list      ")+p("dim","bro-ficiencies"));
       console.log(p("cyan","    /bromance pick      ")+p("dim","interactive installer"));
+      sep("CHAIN", "gold");
       console.log(p("cyan","    /brofile            ")+p("dim","project DNA"));
       console.log(p("cyan","    /chain              ")+p("dim","build chain"));
       console.log("");return;}
@@ -2868,7 +3536,7 @@ function showBuildHistory(){
   }catch(e){console.log(p("dim","\n  No builds yet. Try /build\n"));}
 }
 async function main(){
-  if(process.argv.includes("--skip-intro")){
+  if(process.argv.includes("--skip-intro")||!process.stdout.isTTY){
     console.log(rgb(255,215,0)+BOLD+"\n  builderBRO v3.0"+RST);
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
@@ -2878,6 +3546,9 @@ async function main(){
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
   }
+  var bootBrains = configuredBrains();
+  if(bootBrains.length) console.log(p("dim","  \u{1F9E0} brain: ")+p("good",bootBrains.map(function(b){return b.label;}).join(" -> "))+"\n");
+  else console.log(p("ask","  \u{1F9E0} no LLM brain configured")+p("dim"," - set a key in .env (see /tokens)\n"));
   startHeartbeatDaemon();
   startAutopilot();
   if(tgConfig.enabled && tgConfig.botToken && tgConfig.chatId) { startTelegram(); console.log(p("green","  \u{1F4F1} Telegram bridge active")); }

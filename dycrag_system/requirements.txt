@@ -1,0 +1,7 @@
+# No external Python dependencies required for this basic demonstration
+# All components use standard library features.
+# If you were to integrate a real LLM, you might add:
+# - openai
+# - langchain
+# - faiss-cpu (for vector DB)
+# - transformers

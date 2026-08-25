@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Stake.com Originals Assistant",
+  "version": "1.0",
+  "description": "An assistant for Stake.com Originals games, providing real-time predictions and historical bet analysis.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "*://stake.com/*",
+    "*://*.stake.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://stake.com/casino/originals/*", "*://*.stake.com/casino/originals/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
