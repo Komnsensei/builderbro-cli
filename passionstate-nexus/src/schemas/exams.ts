@@ -1,0 +1,3 @@
+import { z } from "zod";
+export const SubmitTheoryExamSchema = z.object({  applicationId: z.string().min(1),  examVersion: z.string().min(1),  responses: z.array(z.object({    topic: z.string().min(1),    correct: z.boolean()  })).min(1)});
+export const SubmitPracticalAssessmentSchema = z.object({  applicationId: z.string().min(1),  simulationId: z.string().min(1),  proctorId: z.string().min(1),  transcriptMarkers: z.object({    safePrompting: z.number().min(0).max(100),    riskRecognition: z.number().min(0).max(100),    provenancePreservation: z.number().min(0).max(100),    vowCompliance: z.number().min(0).max(100)  })});

@@ -1,0 +1,1 @@
+export const seedQuantumPasses = [{ quantumPassId: "qp_aria_001", humanId: "human_aria_001", jurisdiction: "GLOBAL", participationWeight: 14, careScore: 19, complianceScore: 96, safeUseHistoryMonths: 3, endorsements: [], archiveRefs: ["arc_seed_001"], portabilityStatus: "portable" }];

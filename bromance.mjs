@@ -14,6 +14,20 @@ var broficiencies;
 try{broficiencies=JSON.parse(readFileSync(BROFICIENCIES_F,"utf8"));}catch{broficiencies={installed:[],history:[]};}
 function saveBroficiencies(){try{writeFileSync(BROFICIENCIES_F,JSON.stringify(broficiencies,null,2),"utf8");}catch{}}
 
+// --- Persona State ---
+var _currentPersona = null;
+
+export function setCurrentPersona(persona) {
+  _currentPersona = persona;
+  globalThis.__currentPersona = persona;
+  console.log(globalThis.p("dim","  BRO: Active Persona: "+(persona ? persona.name : "Default")));
+  console.log(globalThis.p("dim","    Temp: "+(persona ? persona.temperature.toFixed(1) : "N/A")+", YOLO: "+(persona ? persona.yoloMode : "N/A")));
+}
+
+export function getCurrentPersona() {
+  return _currentPersona;
+}
+
 var REGISTRIES={
 mcp:[
 {id:"mcp-filesystem",name:"Filesystem MCP",url:"npx -y @modelcontextprotocol/server-filesystem",type:"mcp",desc:"File ops",category:"core",free:true},
@@ -47,7 +61,6 @@ mcp:[
 {id:"mcp-time",name:"Time MCP",url:"npx -y mcp-server-time",type:"mcp",desc:"Time/tz",category:"core",free:true},
 {id:"mcp-vercel",name:"Vercel MCP",url:"npx -y @nganiet/mcp-vercel",type:"mcp",desc:"Vercel",category:"cloud",free:true,needs:"VERCEL_TOKEN"},
 {id:"mcp-figma",name:"Figma MCP",url:"npx -y figma-developer-mcp",type:"mcp",desc:"Figma to code",category:"design",free:true,needs:"FIGMA_TOKEN"},
-{id:"mcp-perplexity",name:"Perplexity MCP",url:"npx -y server-perplexity-ask",type:"mcp",desc:"Perplexity",category:"search",free:true,needs:"PERPLEXITY_KEY"},
 {id:"mcp-tavily",name:"Tavily MCP",url:"npx -y tavily-mcp",type:"mcp",desc:"AI search",category:"search",free:true,needs:"TAVILY_KEY"},
 {id:"mcp-firecrawl",name:"Firecrawl MCP",url:"npx -y firecrawl-mcp",type:"mcp",desc:"Scraping",category:"web",free:true,needs:"FIRECRAWL_KEY"},
 {id:"mcp-youtube",name:"YouTube MCP",url:"npx -y @anaisbetts/mcp-youtube",type:"mcp",desc:"Transcripts",category:"media",free:true},
@@ -63,7 +76,8 @@ mcp:[
 {id:"mcp-1password",name:"1Password MCP",url:"npx -y @1password/mcp-server",type:"mcp",desc:"Secrets",category:"security",free:true,needs:"OP_TOKEN"},
 {id:"mcp-resend",name:"Resend MCP",url:"npx -y resend-mcp",type:"mcp",desc:"Email",category:"comms",free:true,needs:"RESEND_KEY"},
 {id:"mcp-twilio",name:"Twilio MCP",url:"npx -y twilio-mcp",type:"mcp",desc:"SMS",category:"comms",free:true,needs:"TWILIO_TOKEN"},
-{id:"mcp-posthog",name:"PostHog MCP",url:"npx -y @posthog/mcp",type:"mcp",desc:"Analytics",category:"analytics",free:true,needs:"POSTHOG_KEY"}
+{id:"mcp-posthog",name:"PostHog MCP",url:"npx -y @posthog/mcp",type:"mcp",desc:"Analytics",category:"analytics",free:true,needs:"POSTHOG_KEY"},
+{id:"mcp-perplexity",name:"Perplexity MCP",url:"npx -y server-perplexity-ask",type:"mcp",desc:"Perplexity",category:"search",free:true,needs:"PERPLEXITY_KEY"}
 ],
 llm:[
 {id:"groq",name:"Groq",url:"https://api.groq.com/openai/v1",type:"llm",desc:"Fastest inference",category:"ai",free:true},
@@ -125,102 +139,25 @@ api:[
 ],
 tunnel:[
 {id:"serveo",name:"Serveo",url:"ssh -R 80:localhost:PORT serveo.net",type:"tunnel",desc:"SSH tunnel",category:"network",free:true},
-{id:"localhost_run",name:"localhost.run",url:"ssh -R 80:localhost:PORT localhost.run",type:"tunnel",desc:"SSH tunnel",category:"network",free:true},
-{id:"ngrok",name:"ngrok",url:"ngrok http PORT",type:"tunnel",desc:"Tunnel + UI",category:"network",free:true,needs:"NGROK_TOKEN"},
-{id:"cloudflared",name:"CF Tunnel",url:"cloudflared tunnel --url localhost:PORT",type:"tunnel",desc:"Zero-trust",category:"network",free:true},
-{id:"bore",name:"bore.pub",url:"bore local PORT --to bore.pub",type:"tunnel",desc:"TCP",category:"network",free:true},
-{id:"pinggy",name:"Pinggy",url:"ssh -p 443 -R0:localhost:PORT a.pinggy.io",type:"tunnel",desc:"SSH",category:"network",free:true}
-],
-agent:[
-{id:"base44_openclaw",name:"OpenClaw",url:"base44.app",type:"agent",desc:"Primary brain",category:"ai",free:true,needs:"B44_TOKEN"},
-{id:"base44_editor",name:"Editor",url:"base44.app",type:"agent",desc:"Nexus editor",category:"ai",free:true,needs:"B44_KEY"},
-{id:"base44_super",name:"SuperAgent",url:"base44.app",type:"agent",desc:"General",category:"ai",free:true,needs:"B44_KEY"},
-{id:"groq_compound",name:"Groq Compound",url:"https://api.groq.com/openai/v1",type:"agent",desc:"Built-in tools",category:"ai",free:true,needs:"GROQ_KEY"}
-]
+{id:"localhost_run",name:"localhost.run",url:"ssh -R 80:localhost:PORT localhost.run",type:"tunnel",desc:"SSH tunnel",category:"network",free:true}
+]};
+
+// Exports for cli.mjs, etc.
+export var toggleK = function(){
+  // K-factor toggling
 };
-
-
-function bromanceSearch(query){
-  query=query.toLowerCase();var results=[];
-  Object.keys(REGISTRIES).forEach(function(type){REGISTRIES[type].forEach(function(item){
-    var score=0;
-    if(item.name.toLowerCase().includes(query))score+=10;
-    if(item.desc.toLowerCase().includes(query))score+=5;
-    if(item.category.toLowerCase().includes(query))score+=8;
-    if(item.type===query)score+=12;
-    if(item.id.includes(query))score+=7;
-    query.split(/\s+/).forEach(function(w){if(item.name.toLowerCase().includes(w))score+=3;if(item.desc.toLowerCase().includes(w))score+=2;});
-    if(score>0)results.push(Object.assign({},item,{score:score}));
-  });});
-  return results.sort(function(a,b){return b.score-a.score;});
-}
-
-async function bromanceLiveSearch(query,key){
-  if(!key)return[];
-  try{var r=await fetch("https://api.tavily.com/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:"MCP server "+query+" model context protocol npm",search_depth:"advanced",max_results:10,include_domains:["github.com","npmjs.com","smithery.ai"]}),signal:AbortSignal.timeout(15000)});if(!r.ok)return[];var d=await r.json();return(d.results||[]).map(function(res){return{id:"web_"+Math.random().toString(36).substring(7),name:res.title.substring(0,50),url:res.url,type:"discovered",desc:(res.content||"").substring(0,200),category:"discovered",free:true};});}catch{return[];}
-}
-
-function installSkill(item,config){
-  var skill={id:item.id,name:item.name,type:item.type,url:item.url,desc:item.desc,category:item.category,installed:Date.now(),config:config||{},active:true,uses:0};
-  var idx=broficiencies.installed.findIndex(function(s){return s.id===item.id;});
-  if(idx>=0)broficiencies.installed[idx]=skill;else broficiencies.installed.push(skill);
-  broficiencies.history.push({action:"install",id:item.id,time:Date.now()});
-  saveBroficiencies();return skill;
-}
-function uninstallSkill(id){broficiencies.installed=broficiencies.installed.filter(function(s){return s.id!==id;});saveBroficiencies();}
-function toggleSkill(id){var sk=broficiencies.installed.find(function(s){return s.id===id;});if(sk){sk.active=!sk.active;saveBroficiencies();}return sk;}
-
-function generateBrofile(dir){
-  var bf={name:"",stack:[],entry:null,scripts:{},secrets_detected:0,files:0,last_session:new Date().toISOString(),build_streak:0,craft_score:0,context:"",broficiencies:[],created:new Date().toISOString()};
-  bf.name=dir.split(/[/\\]/).pop();
-  try{var items=require("fs").readdirSync(dir);bf.files=items.length;items.forEach(function(f){
-    if(f==="package.json")bf.stack.push("node");if(f==="tsconfig.json")bf.stack.push("typescript");
-    if(f.startsWith("next.config"))bf.stack.push("nextjs");if(f.startsWith("vite.config"))bf.stack.push("vite");
-    if(f==="vercel.json")bf.stack.push("vercel");if(f==="requirements.txt")bf.stack.push("python");
-    if(f==="Cargo.toml")bf.stack.push("rust");if(f==="go.mod")bf.stack.push("go");
-    if(f==="Dockerfile"||f==="docker-compose.yml")bf.stack.push("docker");
-    if(f===".env"||f===".env.local")bf.secrets_detected++;
-    if(f==="tailwind.config.js")bf.stack.push("tailwind");
-  });}catch{}
-  try{var pkg=JSON.parse(readFileSync(join(dir,"package.json"),"utf8"));if(pkg.scripts)bf.scripts=pkg.scripts;if(pkg.main)bf.entry=pkg.main;
-  var deps=Object.keys(pkg.dependencies||{});if(deps.includes("react"))bf.stack.push("react");if(deps.includes("express"))bf.stack.push("express");if(deps.includes("next"))bf.stack.push("nextjs");}catch{}
-  bf.stack=[...new Set(bf.stack)];
-  bf.broficiencies=broficiencies.installed.filter(function(s){return s.active;}).map(function(s){return{id:s.id,name:s.name,type:s.type};});
-  return bf;
-}
-function loadBrofile(dir){try{return JSON.parse(readFileSync(join(dir,".brofile"),"utf8"));}catch{return null;}}
-function saveBrofileToDir(dir,bf){try{writeFileSync(join(dir,".brofile"),JSON.stringify(bf,null,2),"utf8");return true;}catch{return false;}}
-
-function saveProjectContext(dir,ctx){try{var key=dir.replace(/[^a-zA-Z0-9]/g,"_").substring(0,50);writeFileSync(join(CONTEXT_DIR,key+".json"),JSON.stringify(ctx,null,2),"utf8");}catch{}}
-function loadProjectContext(dir){try{var key=dir.replace(/[^a-zA-Z0-9]/g,"_").substring(0,50);return JSON.parse(readFileSync(join(CONTEXT_DIR,key+".json"),"utf8"));}catch{return null;}}
-
-var chain;try{chain=JSON.parse(readFileSync(CHAIN_F,"utf8"));}catch{chain={blocks:[],streak:0,lastBuildDate:null,craftScore:0};}
-function saveChain(){try{writeFileSync(CHAIN_F,JSON.stringify(chain,null,2),"utf8");}catch{}}
-function sealBlock(summary,filesChanged,toolsUsed,tokensSpent){
-  var today=new Date().toISOString().substring(0,10);
-  if(chain.lastBuildDate&&chain.lastBuildDate!==today){var diff=(new Date(today)-new Date(chain.lastBuildDate))/86400000;if(diff===1)chain.streak++;else if(diff>1)chain.streak=1;}else if(!chain.lastBuildDate)chain.streak=1;
-  chain.lastBuildDate=today;
-  var block={id:chain.blocks.length,time:Date.now(),date:today,summary:summary,filesChanged:filesChanged||0,toolsUsed:toolsUsed||0,tokensSpent:tokensSpent||0,streak:chain.streak,
-    hash:createHash("sha256").update(JSON.stringify({s:summary,t:Date.now(),p:chain.blocks.length>0?chain.blocks[chain.blocks.length-1].hash:"genesis"})).digest("hex").substring(0,16)};
-  chain.craftScore+=Math.min(filesChanged*2,20)+Math.min(toolsUsed,10)+chain.streak*2+(tokensSpent>100?5:0);
-  chain.blocks.push(block);if(chain.blocks.length>500)chain.blocks=chain.blocks.slice(-500);saveChain();return block;
-}
-
-var ghostBuffer=[];
-function ghostObserve(cmd){
-  ghostBuffer.push({cmd:cmd,time:Date.now()});if(ghostBuffer.length>50)ghostBuffer=ghostBuffer.slice(-50);
-  var suggestions=[];
-  var recent=ghostBuffer.slice(-10).map(function(g){return g.cmd;});
-  var freq={};recent.forEach(function(c){freq[c]=(freq[c]||0)+1;});
-  Object.entries(freq).forEach(function(e){if(e[1]>=3)suggestions.push({type:"repeat",msg:"You ran '"+e[0]+"' "+e[1]+"x recently. Automate it?",cmd:e[0]});});
-  var last5=ghostBuffer.slice(-5).map(function(g){return g.cmd;});
-  if(last5.some(function(c){return c.includes("write")||c.includes("patch");})&&last5.some(function(c){return c.includes("node ")||c.includes("npm start");}))
-    suggestions.push({type:"workflow",msg:"Edit-restart cycle. Set up auto-reload?"});
-  var gits=ghostBuffer.filter(function(g){return g.cmd.includes("git status");});
-  var lastCommit=ghostBuffer.findLast(function(g){return g.cmd.includes("git commit");});
-  if(gits.length>=3&&(!lastCommit||Date.now()-lastCommit.time>600000))
-    suggestions.push({type:"git",msg:"Checking status without committing. Ready to commit?"});
-  return suggestions;
-}
-
-export{REGISTRIES,bromanceSearch,bromanceLiveSearch,installSkill,uninstallSkill,toggleSkill,broficiencies,saveBroficiencies,generateBrofile,loadBrofile,saveBrofileToDir as saveBrofile,saveProjectContext,loadProjectContext,chain,sealBlock,saveChain,ghostObserve};
+export var toggleTier = function(){
+  // Tier toggling
+};
+export var dumpChain = function(){
+  // Dump chain
+};
+export var dumpBrofile = function(){
+  // Dump brofile
+};
+export var handleTgCommand = function(input){
+  // Telegram commands
+};
+export var ghostObserve = function(input){
+  // Ghost observe
+};

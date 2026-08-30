@@ -1,0 +1,3 @@
+import { makeId } from "../utils/ids.js";import type { EmbodiedSystem } from "../types/domain.js";
+const embodiedStore = new Map<string, EmbodiedSystem>();
+export class EmbodimentService {  register(input: Omit<EmbodiedSystem, "status">) {    const record: EmbodiedSystem = {      ...input,      status: "registered"    };    embodiedStore.set(record.systemId || makeId("emb"), record);    return record;  }}

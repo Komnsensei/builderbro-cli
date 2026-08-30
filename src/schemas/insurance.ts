@@ -1,0 +1,2 @@
+import { z } from "zod";
+export const ValidateInsuranceCoverageSchema = z.object({  policyId: z.string().min(1),  jurisdiction: z.string().min(1),  coverageType: z.enum(["operator", "robotics", "infrastructure"])});

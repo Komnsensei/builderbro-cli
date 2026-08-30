@@ -1,0 +1,16 @@
+import { makeId } from "../utils/ids.js";import type { QuantumPass } from "../types/domain.js";
+const passStore = new Map<string, QuantumPass>();
+export class QuantumPassService {  issue(humanId: string, jurisdiction: string): QuantumPass {    const pass: QuantumPass = {      quantumPassId: makeId("qp"),      humanId,      jurisdiction,      participationWeight: 0,      careScore: 0,      complianceScore: 100,      safeUseHistoryMonths: 0,      endorsements: [],      archiveRefs: [],      portabilityStatus: "portable"    };    passStore.set(pass.quantumPassId, pass);    return pass;  }
+  get(quantumPassId: string): QuantumPass | undefined {    return passStore.get(quantumPassId);  }
+  update(    quantumPassId: string,    delta: Partial<Pick<QuantumPass, "participationWeight" | "careScore" | "complianceScore" | "somaticCoherenceScore" | "safeUseHistoryMonths">>,    archiveRef?: string  ): QuantumPass {    const existing = passStore.get(quantumPassId);    if (!existing) throw new Error(`Quantum Pass not found: ${quantumPassId}`);    const updated: QuantumPass = {
+      ...existing,
+      participationWeight: delta.participationWeight ?? existing.participationWeight,
+      careScore: delta.careScore ?? existing.careScore,
+      complianceScore: delta.complianceScore ?? existing.complianceScore,
+      safeUseHistoryMonths: delta.safeUseHistoryMonths ?? existing.safeUseHistoryMonths,
+      archiveRefs: archiveRef ? [...existing.archiveRefs, archiveRef] : existing.archiveRefs,
+      ...(delta.somaticCoherenceScore === undefined
+        ? (existing.somaticCoherenceScore === undefined ? {} : { somaticCoherenceScore: existing.somaticCoherenceScore })
+        : { somaticCoherenceScore: delta.somaticCoherenceScore })
+    };
+    passStore.set(quantumPassId, updated);    return updated;  }}

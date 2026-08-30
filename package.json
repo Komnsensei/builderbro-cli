@@ -1,0 +1,14 @@
+{
+  "name": "builderbro",
+  "version": "2.0.0",
+  "type": "module",
+  "private": true,
+  "description": "builderBRO - AI coding partner CLI with full web-browsing agent tools",
+  "main": "loader.mjs",
+  "scripts": {
+    "start": "node cli.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

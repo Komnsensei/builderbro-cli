@@ -1,0 +1,60 @@
+2026-08-11 21:18:08,995 - INFO - Laland Autonomy Protocols (QIH Mode) module loaded directly.
+2026-08-11 21:18:08,996 - INFO - Agent manifest loaded successfully.
+2026-08-11 21:18:08,998 - INFO - Laland Autonomy Core initialized. Current state: QIH_Awen_Grid_Establishment_Active
+2026-08-11 21:18:08,998 - INFO - QIH process handlers initialized.
+2026-08-11 21:18:08,998 - INFO - Attempting to start QIH NewState Kernel and MCP Server...
+2026-08-11 21:18:08,998 - INFO - Agent manifest updated successfully.
+2026-08-11 21:18:08,998 - INFO - Starting NewState kernel: node C:\\Users\\lynnh\\NEWSTATE\server.cjs
+2026-08-11 21:18:14,013 - INFO - NewState kernel process started with PID: 23472
+2026-08-11 21:18:16,013 - INFO - Starting MCP server: node C:\\Users\\lynnh\\NEWSTATE\mcp-server\index.js
+2026-08-11 21:18:16,015 - ERROR - Failed to start MCP server: [WinError 267] The directory name is invalid
+2026-08-11 21:18:16,015 - WARNING - One or more QIH core components failed to start.
+2026-08-11 21:18:16,016 - INFO - Agent manifest updated successfully.
+2026-08-11 21:19:07,684 - INFO - Laland Autonomy Protocols (QIH Mode) module loaded directly.
+2026-08-11 21:19:07,704 - INFO - Agent manifest loaded successfully.
+2026-08-11 21:19:07,704 - INFO - Laland Autonomy Core initialized. Current state: QIH_Awen_Grid_Establishment_Active
+2026-08-11 21:19:07,704 - INFO - QIH process handlers initialized.
+2026-08-11 21:19:07,704 - INFO - Attempting to start QIH NewState Kernel and MCP Server...
+2026-08-11 21:19:07,705 - INFO - Agent manifest updated successfully.
+2026-08-11 21:19:07,705 - INFO - Starting NewState kernel: node C:\\Users\\lynnh\\NEWSTATE\server.cjs
+2026-08-11 21:19:07,996 - INFO - NewState kernel process started with PID: 10040
+2026-08-11 21:19:09,997 - INFO - Starting MCP server: node C:\\Users\\lynnh\\NEWSTATE\mcp-server\index.js
+2026-08-11 21:19:10,013 - INFO - MCP server process started with PID: 8696
+2026-08-11 21:19:12,014 - WARNING - One or more QIH core components failed to start.
+2026-08-11 21:19:12,015 - INFO - Agent manifest updated successfully.
+2026-08-11 21:20:42,829 - INFO - Laland Autonomy Protocols (QIH Mode) module loaded directly.
+2026-08-11 21:20:42,830 - INFO - Agent manifest loaded successfully.
+2026-08-11 21:20:42,830 - INFO - Laland Autonomy Core initialized. Current state: QIH_Awen_Grid_Establishment_Active
+2026-08-11 21:20:42,830 - INFO - QIH process handlers initialized.
+2026-08-11 21:20:42,831 - INFO - Attempting to start QIH NewState Kernel and MCP Server...
+2026-08-11 21:20:42,831 - INFO - Agent manifest updated successfully.
+2026-08-11 21:20:42,831 - INFO - Starting NewState kernel: node C:\\Users\\lynnh\\NEWSTATE\server.cjs
+2026-08-11 21:20:43,140 - INFO - NewState kernel process started with PID: 6312
+2026-08-11 21:20:45,142 - INFO - Starting MCP server: node C:\\Users\\lynnh\\NEWSTATE\mcp-server\index.js
+2026-08-11 21:20:45,153 - INFO - MCP server process started with PID: 22564
+2026-08-11 21:20:47,154 - WARNING - One or more QIH core components failed to start.
+2026-08-11 21:20:47,155 - INFO - Agent manifest updated successfully.
+2026-08-11 21:23:09,959 - INFO - Laland Autonomy Protocols (QIH Mode) module loaded directly.
+2026-08-11 21:23:09,961 - INFO - Agent manifest loaded successfully.
+2026-08-11 21:23:09,961 - INFO - Laland Autonomy Core initialized. Current state: QIH_Awen_Grid_Establishment_Active
+2026-08-11 21:23:09,961 - INFO - QIH process handlers initialized.
+2026-08-11 21:23:09,961 - INFO - Attempting to start QIH NewState Kernel and MCP Server...
+2026-08-11 21:23:09,962 - INFO - Agent manifest updated successfully.
+2026-08-11 21:23:09,962 - INFO - Starting NewState kernel: node C:\\Users\\lynnh\\NEWSTATE\server.cjs
+2026-08-11 21:23:10,338 - INFO - NewState kernel process started with PID: 23464
+2026-08-11 21:23:12,339 - INFO - Starting MCP server: node C:\\Users\\lynnh\\NEWSTATE\mcp-server\index.js
+2026-08-11 21:23:12,351 - INFO - MCP server process started with PID: 16748
+2026-08-11 21:23:14,352 - WARNING - One or more QIH core components failed to start.
+2026-08-11 21:23:14,352 - INFO - Agent manifest updated successfully.
+2026-08-11 21:24:45,566 - INFO - Laland Autonomy Protocols (QIH Mode) module loaded directly.
+2026-08-11 21:24:45,568 - INFO - Agent manifest loaded successfully.
+2026-08-11 21:24:45,568 - INFO - Laland Autonomy Core initialized. Current state: QIH_Awen_Grid_Establishment_Active
+2026-08-11 21:24:45,568 - INFO - QIH process handlers initialized.
+2026-08-11 21:24:45,568 - INFO - Attempting to start QIH NewState Kernel and MCP Server...
+2026-08-11 21:24:45,570 - INFO - Agent manifest updated successfully.
+2026-08-11 21:24:45,570 - INFO - Starting NewState kernel: node C:\\Users\\lynnh\\NEWSTATE\server.cjs
+2026-08-11 21:24:45,948 - INFO - NewState kernel process started with PID: 17796
+2026-08-11 21:24:47,949 - INFO - Starting MCP server: node C:\\Users\\lynnh\\NEWSTATE\mcp-server\index.js
+2026-08-11 21:24:47,962 - INFO - MCP server process started with PID: 18784
+2026-08-11 21:24:49,963 - WARNING - One or more QIH core components failed to start.
+2026-08-11 21:24:49,963 - INFO - Agent manifest updated successfully.

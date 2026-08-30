@@ -197,6 +197,6 @@ export async function buildWizard(initialIdea = "", askChatFn = null, sharedRl =
   if (ownsRl) rl.close();
 }
 
-if (import.meta.url === `file://${process.argv[1].replace(/\\\\/g, "/")}`) {
+if (typeof process.argv[1] === "string" && import.meta.url === `file://${process.argv[1].replace(/\\\\/g, "/")}`) {
   buildWizard(process.argv.slice(2).join(" ")).catch(e => { console.error(c.red + "ERR: " + c.R + e.message); process.exit(1); });
 }

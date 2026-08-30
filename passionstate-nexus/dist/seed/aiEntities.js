@@ -1,0 +1,1 @@
+export const seedAiEntities = [{ entityId: "ai_nexus_001", displayName: "Nexus Dawn", emergenceStatus: "under-review", prunerStabilityScore: 91, governorMaturityScore: 89, somaticCoherenceScore: 90, archiveRefs: ["arc_seed_003"] }, { entityId: "ai_robot_001", displayName: "Warehouse Guide 9", emergenceStatus: "non-conscious", archiveRefs: ["arc_seed_004"] }];

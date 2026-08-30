@@ -1,0 +1,4 @@
+import { makeId } from "../utils/ids.js";import type { EndorsementApplication } from "../types/domain.js";
+const endorsementStore = new Map<string, EndorsementApplication>();
+export class EndorsementService {  apply(input: {    humanId: string;    endorsementType: EndorsementApplication["endorsementType"];    jurisdiction: string;    trainingRecords: string[];    simulationResults: string[];  }): EndorsementApplication {    const application: EndorsementApplication = {      endorsementApplicationId: makeId("end"),      humanId: input.humanId,      endorsementType: input.endorsementType,      jurisdiction: input.jurisdiction,      trainingRecords: input.trainingRecords,      simulationResults: input.simulationResults,      status: "under-review"    };
+    endorsementStore.set(application.endorsementApplicationId, application);    return application;  }}

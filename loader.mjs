@@ -168,5 +168,5 @@ if (!process.stdin.isTTY && pipeInstruction){
   // Store bromance globals for the main script, then run it.
   var bromance = await import("./bromance.mjs");
   globalThis.__bromance = Object.assign({}, bromance, bromance.default || {});
-  await import("./cli1.mjs");
+  await import("./cli.mjs");
 }

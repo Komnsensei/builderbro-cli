@@ -1,0 +1,2 @@
+import { z } from "zod";
+export const RegisterEmbodiedSystemSchema = z.object({  systemId: z.string().min(1),  ownerLicenseId: z.string().min(1),  deviceClass: z.string().min(1),  jurisdiction: z.string().min(1),  insurancePolicyId: z.string().min(1),  operatingScope: z.string().min(1)});
