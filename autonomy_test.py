@@ -296,6 +296,113 @@ class PlanParserTest(_FixtureCase):
         with self.assertRaises(autonomy.PlanError):
             autonomy.parse_plan(_plan(steps, "contains:a"))
 
+    def test_quotes_around_a_needle_are_punctuation_not_content(self):
+        # Measured live: `expect: contains:"agent_runtime.py"` read literally made
+        # every step fail and the run die `no_progress`. The model was right.
+        self.assertEqual(autonomy.parse_spec('contains:"agent_runtime.py"'),
+                         ("contains", "agent_runtime.py"))
+        self.assertEqual(autonomy.parse_spec("absent:'done'"), ("absent", "done"))
+        self.assertEqual(autonomy.parse_spec('contains:``x``'), ("contains", "x"))
+        # An *unquoted* regex keeps its own text: that escaping is the pattern's.
+        self.assertEqual(autonomy.parse_spec(r"regex:(?s).*\n.*"),
+                         ("regex", "(?s).*\\n.*"))
+
+    def test_a_quoted_regex_is_an_escaped_string_literal(self):
+        # Measured live 2026-09-19 (`nameable` arm of `live_refusal_probe.py`): in
+        # all four runs the model wrote its regex in quotes with doubled
+        # backslashes — `regex:"[0-9]+\\\\.?[0-9]*"`. Read literally the pattern
+        # demands a backslash and matches no JSON text, so the gate reported
+        # `hit: false` on 724 chars of evidence the previous step had verified at
+        # `invariant` and failed a run whose goal check was *correct*. Quoting is
+        # what makes it a string literal, so its escapes are notation.
+        self.assertEqual(autonomy.parse_spec('regex:"a\\\\d+"'), ("regex", "a\\d+"))
+        self.assertEqual(autonomy.parse_spec('regex:"[0-9]+\\\\.?[0-9]*"'),
+                         ("regex", "[0-9]+\\.?[0-9]*"))
+        # Unquoted, the escaping is the author's own and is left exactly alone.
+        self.assertEqual(autonomy.parse_spec(r"regex:[0-9]+\.?[0-9]*"),
+                         ("regex", "[0-9]+\\.?[0-9]*"))
+        # Nothing to decode is not a wildcard: an empty regex is malformed.
+        self.assertIsNone(autonomy.parse_spec('regex:""'))
+
+    def test_a_decoded_regex_matches_the_evidence_it_was_written_for(self):
+        # The property, not just the parse: the shape the model wrote must match
+        # the JSON it was checking, and stay strong enough for the gate.
+        spec = autonomy.parse_spec('regex:"[0-9]+\\\\.?[0-9]*"')
+        ok, detail = autonomy.verify(spec, '{"recall_min_score": 0.25}')
+        self.assertTrue(ok, detail)
+        self.assertEqual(autonomy.spec_strength(spec), "strong")
+
+    def test_escapes_inside_a_quoted_needle_are_decoded(self):
+        # `contains:"\n"` means a newline is present; read literally the needle is
+        # backslash-n, which is in no listing. Only the named set is decoded.
+        self.assertEqual(autonomy.parse_spec('contains:"\\n"'), ("contains", "\n"))
+        self.assertEqual(autonomy.parse_spec('contains:"a\\tb"'), ("contains", "a\tb"))
+        self.assertEqual(autonomy.parse_spec('contains:"a\\\\b"'), ("contains", "a\\b"))
+        # An unknown escape is left alone rather than guessed at.
+        self.assertEqual(autonomy.parse_spec('contains:"a\\qb"'), ("contains", "a\\qb"))
+
+    def test_a_needle_that_decodes_to_nothing_is_refused(self):
+        # `contains:""` would be satisfied by every output: malformed, not a
+        # wildcard wearing a `contains:` label.
+        self.assertIsNone(autonomy.parse_spec('contains:""'))
+        self.assertIsNone(autonomy.parse_spec("contains:''"))
+
+    def test_an_unmatched_quote_is_kept_as_content(self):
+        # Only a *matched* pair is punctuation; a needle that genuinely starts or
+        # ends with a quote must survive.
+        self.assertEqual(autonomy.parse_spec('contains:error"'), ("contains", 'error"'))
+        self.assertEqual(autonomy.parse_spec('contains:"a'), ("contains", '"a'))
+
+    def test_a_quoted_expectation_from_a_real_model_verifies_and_advances(self):
+        # The live shape end to end: the expectation the model actually wrote, in
+        # quotes, must verify against the output it described.
+        spec = autonomy.parse_spec('contains:"README.md"')
+        ok, detail = autonomy.verify(spec, "index.html\nREADME.md\nnotes.md\n")
+        self.assertTrue(ok, detail)
+        self.assertFalse(autonomy.verify(spec, "index.html\nnotes.md\n")[0])
+
+    def test_a_compact_one_line_step_parses(self):
+        # The shape a real model emits (measured live). The whole line used to
+        # parse as a *tool* whose argument was "list_dir . expect: regex:.+", so
+        # the plan was refused as `plan_invalid`.
+        plan = autonomy.parse_plan(
+            "PLAN:\n"
+            "1. tool: list_dir . expect: contains:README.md\n"
+            "GOAL-CHECK: contains:README.md\n")
+        self.assertEqual(len(plan.steps), 1)
+        self.assertEqual((plan.steps[0].tool, plan.steps[0].arg), ("list_dir", "."))
+        self.assertEqual(plan.steps[0].expect, ("contains", "README.md"))
+        self.assertEqual(plan.goal_check, ("contains", "README.md"))
+
+    def test_a_compact_step_can_carry_its_goal_check_on_the_same_line(self):
+        plan = autonomy.parse_plan(
+            "PLAN:\n1. tool: read_file ./notes.md expect: contains:alpha-token "
+            "GOAL-CHECK: contains:alpha-token\n")
+        self.assertEqual((plan.steps[0].tool, plan.steps[0].arg),
+                         ("read_file", "./notes.md"))
+        self.assertEqual(plan.steps[0].expect, ("contains", "alpha-token"))
+        self.assertEqual(plan.goal_check, ("contains", "alpha-token"))
+
+    def test_the_expanded_form_still_parses_unchanged(self):
+        # Two shapes, one parser: the documented multi-line form must not drift.
+        plan = autonomy.parse_plan(
+            "PLAN:\n"
+            "1. tool: list_dir .\n"
+            "   expect: contains:README.md\n"
+            "GOAL-CHECK: contains:README.md\n")
+        self.assertEqual(plan.steps[0].expect, ("contains", "README.md"))
+        self.assertEqual(plan.steps[0].arg, ".")
+
+    def test_an_embedded_field_keyword_inside_an_argument_is_left_alone(self):
+        # The split needs whitespace and a colon, so a path or word that merely
+        # contains "check" is still an argument.
+        plan = autonomy.parse_plan(
+            "PLAN:\n"
+            "1. tool: read_file ./checklist.md\n"
+            "   expect: contains:checklist\n"
+            "GOAL-CHECK: contains:checklist\n")
+        self.assertEqual(plan.steps[0].arg, "./checklist.md")
+
     def test_the_system_prompt_states_the_grammar_and_the_weakness_rule(self):
         prompt = autonomy.plan_system_prompt("Test")
         for kind in autonomy.SPEC_KINDS:
@@ -335,6 +442,36 @@ class CompletionGateTest(_FixtureCase):
         result, _g = self.run_loop([self.plan_ok(), _call("list_dir", self.root),
                                     "FINAL:   \n"])
         self.assertEqual(result["reason"], "empty_answer")
+        # One bounded ask, then the failure: the counter is what keeps this from
+        # becoming an unbounded retry loop.
+        self.assertEqual(result["empty_answers"], 1)
+
+    def test_a_bare_final_is_asked_for_its_answer_before_failing(self):
+        # Measured live: the model collected a confirmed step, the goal condition
+        # held over it, and it then sent a bare `FINAL:` — so a run that had already
+        # earned its evidence was discarded over missing text. One ask converts it.
+        result, _g = self.run_loop([self.plan_ok(), _call("list_dir", self.root),
+                                    "FINAL:", "FINAL: README.md is present"])
+        self.assertTrue(result["ok"], result["failure"])
+        self.assertEqual(result["empty_answers"], 1)
+        self.assertEqual(result["verified_steps"], 1)
+
+    def test_the_ask_cannot_manufacture_evidence(self):
+        # The reason the repair is safe: the gate still reads only what the tools
+        # returned, so a model that answers without collecting anything still fails.
+        result, _g = self.run_loop([self.plan_ok(), "FINAL: README.md is present"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "unverified_completion")
+
+    def test_the_nudge_names_simulated_output_as_not_evidence(self):
+        # The success arm's first live run answered the step directive with a
+        # listing it had made up (two of the names do not exist) instead of the
+        # tool call. The nudge says so now, which is a hypothesis the live probe
+        # tests — not a fix with proof behind it.
+        plan = autonomy.parse_plan(self.plan_ok())
+        note = autonomy._nudge(plan, 0)
+        self.assertIn("no tool has run", note)
+        self.assertIn("<<<TOOL:list_dir", note)
 
     def test_a_goal_cannot_verify_over_empty_evidence(self):
         # `absent:X` is satisfied by a vacuum, so a run that promoted nothing could
@@ -803,6 +940,45 @@ class VerifierPromotionTest(_FixtureCase):
         self.assertEqual(result["diagnosis"]["detail"]["evidence_levels"],
                          {"invariant": 1})
 
+    def test_a_replan_keeps_the_evidence_this_run_already_confirmed(self):
+        # Measured live 2026-09-19 (`nameable#1`): a run verified
+        # `read_file ./loop_guard.json` at `invariant`, replanned because a later
+        # step failed, and then failed its goal check over **zero** characters of
+        # evidence while its own record reported `invariant: 1`. The goal held over
+        # the observation the run had already earned and independently confirmed, so
+        # the run was failed for replanning — the behaviour the loop demands.
+        good = _plan([("list_dir", self.root, "contains:README.md")],
+                     "contains:README.md")
+        bad = _plan([("read_file", os.path.join(self.root, "missing.md"),
+                      "contains:missing-token")], "contains:README.md")
+        result, _g = self.run_loop([good, _call("list_dir", self.root),
+                                    "REPLAN:\n" + bad,
+                                    _call("read_file",
+                                          os.path.join(self.root, "missing.md")),
+                                    "FINAL: README.md is present"])
+        self.assertTrue(result["ok"], result["failure"])
+        self.assertEqual(result["replans"], 1)
+        self.assertEqual(result["verified_steps"], 1)
+
+    def test_a_replan_does_not_make_the_failure_record_contradict_itself(self):
+        # The mirror, with the goal unreachable: the detail must never report
+        # confirmed evidence and zero characters at once, or a reader of the ledger
+        # cannot tell "nothing was verified" from "the verified output was dropped".
+        good = _plan([("list_dir", self.root, "contains:README.md")],
+                     "contains:README.md")
+        bad = _plan([("read_file", os.path.join(self.root, "missing.md"),
+                      "contains:missing-token")], "contains:zzz-unreachable")
+        result, _g = self.run_loop([good, _call("list_dir", self.root),
+                                    "REPLAN:\n" + bad,
+                                    _call("read_file",
+                                          os.path.join(self.root, "missing.md")),
+                                    "FINAL: README.md is present"])
+        self.assertEqual(result["reason"], "unverified_completion")
+        promoted = sum(e["chars"] for e in result["evidence"])
+        self.assertGreater(promoted, 0)
+        self.assertEqual(result["evidence_levels"]["invariant"], 1)
+        self.assertEqual(result["diagnosis"]["detail"]["evidence_chars"], promoted)
+
     def test_the_verifier_is_revertible_from_config(self):
         # The `repeat_mode` pattern: a rule change has to be switchable from the
         # registered config, not only by editing code.
@@ -889,14 +1065,20 @@ class EmptyReplyEscalationTest(_FixtureCase):
 
     def test_an_empty_plan_reply_gets_the_same_room(self):
         # The plan call is the first call a run makes, so the same cap problem
-        # there costs the whole run.
+        # there costs the whole run — and measured live it did: the model spent
+        # 512/512 tokens of deliberation and returned no plan, then produced it in
+        # 1,099 tokens once the retry escalated. So the registered default *starts*
+        # at the escalation ceiling; asserting against the bare
+        # `PLAN_MAX_TOKENS` constant would re-encode the wasted first call.
+        t = loop_guard.active_thresholds()
+        self.assertGreater(t["plan_max_tokens"], autonomy.PLAN_MAX_TOKENS)
         result, caps, _g = self._run(
             ["", self.plan_ok(), _call("list_dir", self.root),
              "FINAL: README.md is here"],
             empty_tokens=lambda cap: cap, supplied=False)
         self.assertTrue(result["ok"], result["failure"])
-        self.assertEqual(caps[0], autonomy.PLAN_MAX_TOKENS)
-        self.assertEqual(caps[1], 2048)
+        self.assertEqual(caps[0], t["plan_max_tokens"])
+        self.assertEqual(caps[1], t["empty_reply_token_ceiling"])
 
     def test_the_failure_names_the_cap_it_exhausted(self):
         # A reader of a failed run has to be able to tell a budget from a drop.

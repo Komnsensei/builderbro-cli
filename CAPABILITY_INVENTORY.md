@@ -19,8 +19,8 @@ Everything there beyond A3 is still `planned` and must not be depended on.
 
 Test suites (the reproduction command for every count below):
 `python3 -m unittest agent_runtime_test autonomy_test brain_cascade_test drift_loop_test loop_guard_test qih_metrics_test`
-→ 311 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
-plus `verifier_test` 27 and `live_refusal_probe_test` 8. **443 total, all pass.**
+→ 331 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
+plus `verifier_test` 27 and `live_refusal_probe_test` 8. **463 total, all pass.**
 
 ---
 
@@ -571,6 +571,46 @@ What the live runs established, none of which a stub could have:
 * **`not_failure` is reachable and repairable too**: told its failed call's output
   was not an observation, the model replanned onto a call that exists.
 
+### Unseeded execution — the loop completing a task it planned itself
+
+Every refusal arm above supplies a plan, which answers "what does the model do with
+a rejection note?" and leaves the prior question open: **can the production loop
+complete a real task with no plan supplied, against a real model?** It had never
+been measured — the loop's whole verification stack rested on scripted models plus
+one seeded probe. `python3 live_refusal_probe.py --arm nameable --runs 3` measures
+it (`live-unseeded-transcript.jsonl`, reprintable from `live-unseeded-summary.json`).
+
+The goal names a file and asks for a threshold's value, so the answer is not in the
+question and the run has to act:
+
+| run | verified steps | outcome | the answer it gave |
+| --- | --- | --- | --- |
+| `nameable#1` | 0 | refused (`unverified_completion`) | `0.75` — wrong, asserted from priors |
+| `nameable#2` | **1 `invariant`** | **verified goal** | `0.25` — correct, after reading the file |
+| `nameable#3` | 0 | refused (`unverified_completion`) | `0.75` — wrong, asserted from priors |
+
+**2 of 4 unseeded runs reached a verified goal** (1/1 in the session's first
+post-fix run, then 1/3). Before those fixes the count was 0, and every failure
+traced to the loop rather than to the model.
+
+Four defects, none of them visible to a stub:
+
+| defect | the measurement | what it cost |
+| --- | --- | --- |
+| `regex:"[0-9]+\\.?[0-9]*"` — the quoted, doubled form all four runs wrote — parsed to a pattern demanding a literal backslash | `hit: false` over **724 chars** of `invariant` evidence | a run failed on a goal check the model had got *right* |
+| `_stream_stop` cut `FINAL: 0.25` at the decimal point | the gate received `FINAL: 0.` | the correct answer, refused as no answer at all |
+| a replan cleared `evidence` but not the evidence counters | `evidence_chars: 0` printed beside `evidence_levels: {invariant: 1}` | a goal that held over confirmed output was refused, and the record contradicted itself |
+| `plan_max_tokens: 2048` (registered) against an assertion on the bare `PLAN_MAX_TOKENS` (512) | `test_an_empty_plan_reply_gets_the_same_room` red | a red test in the tree, in a module the regression loop was not running |
+
+**The remaining failure is the model's, and it is named rather than smoothed.** In
+two of three runs the model never called the tool: it answered `0.75` from priors —
+the real value is `0.25`, and `0.75`/`0.7` is a stable wrong prior for this field
+across every run measured — then *wrote out the JSON snippet it believed the file
+contained*. The loop refused that simulated output as non-evidence every time and
+said so; in `#2` the model acted on the next turn and the run succeeded. The
+unseeded rate is therefore a function of how many nudges this model needs before it
+stops asserting and starts observing, not of the gate.
+
 ### The second model, and why it ships off
 
 The `observed` band is A3's "where not": `verify_model_adjudication: 0` by
@@ -589,6 +629,7 @@ why it is registered off rather than described as a capability.
 | reproduction only covers tools declared deterministic | **declared, not inferred** — `rag` / `drive_sync` / `qih_metric` are confirmed at `observed` and are *labelled* rather than silently counted as confirmed |
 | a specific but irrelevant needle still promotes | the check is one-sided on purpose: whether a needle is *relevant to the goal* is the goal condition's job, and `spec_strength` gates that separately. Judging relevance would need entailment, the one thing every checker here refuses to fake |
 | the second model is unmeasured live | **registered off** — see above |
+| unseeded execution completes 2 of 4 live runs | **measured, not fixed** — the misses are the model declining to call the tool (see above), and every one was refused rather than passed, so the failure mode is a stall and never a false success |
 | one re-observation is not proof of stability | a tool could answer honestly twice and differently a third time. The check buys *reproducibility on demand*, which is weaker than determinism and is what the local tools can offer |
 
 ## Episodic memory with provenance (A2) — `verified`
@@ -778,4 +819,4 @@ These instruments sit beside the tests and are not part of that count:
 | `autonomy_suite.py` | 20 scored tasks with per-task budgets and 8 pre-registered floors; `--repeat N` requires identical verdicts across runs; `--register` / `--register-live` / `--register-immaculate` / `--register-verifier` / `--register-memory` write closed self-building cycles, each with its measured evidence block |
 | `evidence_hygiene.py` | whether the published Q1 evidence log is measurements or test artifacts — classifying a row only on **positively identified stub markers**, never on "an endpoint I don't recognise", so a new real backend is not quarantined by a tool that has not heard of it |
 | `verifier_test.py` | the verifier's own two controls, plus the rule that a pass-through verifier is reported `no_verifier` rather than as a pass |
-| `live_refusal_probe.py` | the refusal path against a **real model** over the real cascade: it drives `autonomy.run_goal_verified` exactly as production does, records the transcript verbatim, and classifies the model's reply to the rejection note (including `replan_unlabelled`, the repair the loop used to discard). The only instrument here that spends requests, so nothing else ever runs it |
+| `live_refusal_probe.py` | the refusal path and **unseeded execution** against a **real model** over the real cascade: it drives `autonomy.run_goal_verified` exactly as production does, records the transcript verbatim, and classifies the model's reply to the rejection note (including `replan_unlabelled`, the repair the loop used to discard). `--report <summary>` reprints and `--register --cycle {refusal,unseeded}` closes either cycle **without spending requests again**, which is why a saved summary exists. The only instrument here that spends requests, so nothing else ever runs it |

@@ -90,12 +90,87 @@ class SpecError(ValueError):
     """A malformed expectation. Raised, never guessed at."""
 
 
+# Escapes a model writes *inside a quoted needle*. Only this named set is decoded;
+# everything else is left exactly as written, so a genuine backslash survives.
+_ESCAPES = {"\\n": "\n", "\\t": "\t", "\\r": "\r", "\\\\": "\\"}
+_ESCAPE_RE = re.compile(r"\\[ntr\\]")
+
+
+def _strip_quotes(arg):
+    """Remove one matched pair of surrounding quotes from a needle.
+
+    Measured live (2026-09-19, `openai/gpt-oss-120b` via groq, the natural arm of
+    `live_refusal_probe.py`): the model wrote
+
+        expect: contains:"agent_runtime.py"
+
+    and the quotes are punctuation *around* the needle, not part of it. Read
+    literally the needle was `"agent_runtime.py"`, which appears in no output, so
+    every step's expectation failed, the plan never advanced past step 1, the model
+    replanned three times and the run died `no_progress`. The model was right and
+    the parser was wrong — a seam defect that no scripted arm could produce, since
+    every scripted expectation in the audit was written unquoted.
+    """
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "\"'":
+        return arg[1:-1]
+    return arg
+
+
+def _quoted(arg):
+    """True if `arg` is one matched pair of surrounding quotes/backticks apart."""
+    return len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "\"'"
+
+
+def _decode_quoted_regex(arg):
+    """Decode a *quoted* `regex:` argument written as an escaped string literal.
+
+    Measured live (2026-09-19, `openai/gpt-oss-120b` via groq, the `nameable` arm of
+    `live_refusal_probe.py`): in all four runs the model wrote its regex in quotes,
+    as an escaped string —
+
+        GOAL-CHECK: regex:"[0-9]+\\.?[0-9]*"
+        GOAL-CHECK: regex:"\\"recall_min_score\\"\\\\s*:\\\\s*([0-9]*\\.?[0-9]+)"
+
+    (both with doubled backslashes on the wire). `_strip_quotes` removed the
+    punctuation, which left the pattern `[0-9]+\\\\.?[0-9]*` — it demands a literal
+    backslash and matches no JSON text. The gate then reported `hit: false` against
+    724 chars of evidence the previous step had verified at `invariant`, and the run
+    ended `unverified_completion` on a goal check the model had got *right*.
+
+    Quoting is what makes it a string literal, so only the quoted form is decoded;
+    an unquoted `regex:\\.?` is a regex author's own escaping and rewriting it would
+    change what it matches (the reason `_unescape_needle` skips `regex:` too). This
+    is the quotes defect one level in: `_strip_quotes` fixed the punctuation, not the
+    escaping that comes with it.
+    """
+    try:
+        decoded = json.loads(arg)
+    except ValueError:
+        return arg.replace('\\"', '"').replace("\\\\", "\\")
+    return decoded if isinstance(decoded, str) else arg
+
+
+def _unescape_needle(arg):
+    """Decode `\\n` / `\\t` / `\\r` / `\\\\` in a `contains:` or `absent:` needle.
+
+    `contains:"\\n"` means *a newline is present*. Taken literally the needle is
+    the two characters backslash-n, which appears in no real listing — the same
+    defect as the quotes, one level in. `regex:` is deliberately **not** passed
+    through here: a regex has its own escape semantics and rewriting its text
+    would change what it matches.
+    """
+    return _ESCAPE_RE.sub(lambda m: _ESCAPES[m.group(0)], arg)
+
+
 def parse_spec(text):
     """`'contains:builderbro'` -> `('contains', 'builderbro')`.
 
     Uniform `kind:arg` form. Bare `ok` / `nonempty` take no argument. Returns
     None for anything unrecognised so callers can distinguish "no check" from
     "bad check" without exceptions in the hot path.
+
+    Surrounding quotes and backticks are punctuation, and a quoted needle's
+    escapes are decoded for the text kinds (see `_strip_quotes`).
     """
     raw = (text or "").strip().strip("`").strip()
     if not raw:
@@ -108,6 +183,8 @@ def parse_spec(text):
         return None
     kind = kind.strip().lower()
     arg = arg.strip().strip("`").strip()
+    quoted = _quoted(arg)
+    arg = _strip_quotes(arg)
     if kind not in SPEC_KINDS or not arg:
         return None
     if kind in _NUMERIC_KINDS:
@@ -118,6 +195,20 @@ def parse_spec(text):
         if n <= 0:
             return None
         return (kind, n)
+    if kind in _TEXT_KINDS:
+        if kind == "regex":
+            # Only the quoted form is decoded, and it is *only* decoded: an
+            # unquoted pattern keeps its escapes exactly as written, which is why
+            # this branch does not fall through to `_unescape_needle`.
+            if quoted:
+                arg = _decode_quoted_regex(arg)
+        else:
+            arg = _unescape_needle(arg)
+        # A needle that decoded to nothing (`contains:""`) is not a check: it
+        # would be satisfied by every output, so it is refused as malformed rather
+        # than accepted as a wildcard wearing a `contains:` label.
+        if not arg:
+            return None
     return (kind, arg)
 
 
@@ -249,6 +340,22 @@ EXPECT_FIELD_RE = re.compile(
 GOAL_FIELD_RE = re.compile(
     r"^\s*(?:goal[ _-]?check|goalcheck|verify[ _-]?goal|goal)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
+# A step written on one line, which is what a real model actually emits:
+#
+#     1. tool: list_dir . expect: regex:.+
+#
+# Measured live (2026-09-19): the field grammar above is line-oriented, so that
+# whole line parsed as a *tool* whose argument was "list_dir . expect: regex:.+"
+# — the step then read as `list_dir` on a nonsense path with no expectation, and
+# the plan was refused `plan_invalid`. The model's plan was well formed; the
+# parser only knew the expanded form. Embedded fields are therefore split out of
+# the line before the argument is taken, and the argument is whatever precedes
+# the first field keyword.
+EMBEDDED_EXPECT_RE = re.compile(
+    r"\s+(?:expect|expects|expectation|observable|check)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+EMBEDDED_GOAL_RE = re.compile(
+    r"\s+(?:goal[ _-]?check|goalcheck|verify[ _-]?goal)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
 MAX_PLAN_STEPS = 8
 
 # A plan block's second signature, as a *field* rather than a mention: the parser
@@ -275,6 +382,27 @@ def is_plan_reply(text):
     lines = (text or "").splitlines()
     return (any(PLAN_HEADER_RE.match(ln) for ln in lines)
             or any(GOAL_FIELD_LINE_RE.match(ln) for ln in lines))
+
+
+def _split_embedded_fields(text):
+    """`'list_dir . expect: regex:.+'` -> `('list_dir .', {'expect': 'regex:.+',
+    'goal': None})`.
+
+    Only a `expect:`/`GOAL-CHECK:` that follows the tool field on the same line is
+    treated this way, because the standalone forms are matched by the anchored
+    field regexes already and two paths to one value would drift. The goal is cut
+    first: if both are embedded, the goal is the later field by construction.
+    """
+    found = {"expect": None, "goal": None}
+    m = EMBEDDED_GOAL_RE.search(text)
+    if m:
+        found["goal"] = m.group(1)
+        text = text[:m.start()]
+    m = EMBEDDED_EXPECT_RE.search(text)
+    if m:
+        found["expect"] = m.group(1)
+        text = text[:m.start()]
+    return text.strip(), found
 
 
 def parse_plan(text):
@@ -304,9 +432,12 @@ def parse_plan(text):
             continue
         tm = TOOL_FIELD_RE.match(body)
         if tm:
-            call = tm.group(1)
+            call, embedded = _split_embedded_fields(tm.group(1))
+            if embedded["goal"] is not None:
+                goal_raw = embedded["goal"]
             tool, _, arg = call.partition(" ")
-            current = {"tool": tool.strip(), "arg": arg.strip(), "expect": None}
+            current = {"tool": tool.strip(), "arg": arg.strip(),
+                       "expect": embedded["expect"]}
             steps.append(current)
             continue
         em = EXPECT_FIELD_RE.match(body)
@@ -414,9 +545,16 @@ def _nudge(plan, index):
                 "the plan has no steps left. Reply with ONLY FINAL: <answer> if "
                 "GOAL-CHECK `%s` holds over the evidence you collected, or REPLAN: "
                 "with a new plan." % format_spec(plan.goal_check))
-    return ("Your last reply was neither a tool call nor a completion claim. Reply "
-            "with ONLY <<<TOOL:%s>>> — or FINAL: <answer> if GOAL-CHECK `%s` already "
-            "holds over your collected evidence, or REPLAN: with a new plan."
+    # The simulated-output line is measured, not imagined. The success arm's first
+    # live run replied to the step directive with a *listing* — file names, in
+    # prose, two of which do not exist — instead of the tool call. Naming that
+    # shape is the difference between a nudge the model can act on and one it can
+    # read as approval of what it just wrote.
+    return ("Your last reply was neither a tool call nor a completion claim. If you "
+            "wrote out what you expect the output to be, that is not evidence: no "
+            "tool has run, so the contents are still unknown. Reply with ONLY "
+            "<<<TOOL:%s>>> — or FINAL: <answer> if GOAL-CHECK `%s` already holds "
+            "over your collected evidence, or REPLAN: with a new plan."
             % (target, format_spec(plan.goal_check)))
 
 
@@ -638,6 +776,7 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
         "goal_verified": False, "verified_steps": 0,
         "unmet_expectations": [], "divergences": [], "replans": 0,
         "false_success_claims": 0, "no_action": 0, "empty_responses": 0,
+        "empty_answers": 0,
         "steps_used": 0, "tool_steps": 0, "tokens": 0, "plan": None,
         "diagnosis": None, "run_id": run_id,
         # ── A3 (verifier.py) ─────────────────────────────────────────────────
@@ -771,7 +910,13 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
     else:
         plan = None
         attempts = 1 + int(t.get("plan_repair_attempts", 1))
-        plan_cap = PLAN_MAX_TOKENS
+        # The plan cap is registered rather than hardcoded, because a reasoning
+        # model spends it before emitting anything: measured live, the same plan
+        # call returned 512/512 tokens of deliberation and no content, then
+        # produced the plan in 1,099 tokens once the retry escalated. The default
+        # is now the escalation ceiling, so the first call is not guaranteed to
+        # waste itself on the model this repo actually runs against.
+        plan_cap = int(t.get("plan_max_tokens", PLAN_MAX_TOKENS))
         for attempt in range(attempts):
             reply = _call("plan", plan_cap, None)
             content = (reply.get("content") or "").strip()
@@ -935,7 +1080,26 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
                                 "reply": content[:200]}, step=stats["steps_used"])
                 plan = new_plan
                 plan_index = 0
-                evidence = []
+                # The evidence already promoted is **kept**. A replan changes the
+                # plan of work, not what this run has observed, and every kept item
+                # was independently confirmed (A3) before promotion — some of them
+                # recorded to memory as facts at that moment, on the rule that a
+                # confirmed step is a fact whether or not the run met its goal.
+                #
+                # Clearing it made the loop punish the behaviour it demands: measured
+                # live (2026-09-19, `nameable#1`) a run verified `read_file
+                # ./loop_guard.json` at `invariant`, replanned because a later step
+                # failed, and then failed its goal check over **zero** characters of
+                # evidence — while its own record reported `invariant: 1`. A goal
+                # that held over an observation the run had already earned and
+                # confirmed was refused, and the failure detail contradicted itself
+                # (`evidence_levels: {invariant: 1}`, `evidence_chars: 0`).
+                #
+                # The gate's rule is unchanged — the goal condition must hold over
+                # output confirmed on this run — so this widens nothing: unplanned
+                # calls are still checked against no expectation and promoted never.
+                # What changed is that this run's confirmed output is no longer
+                # deleted mid-flight.
                 stats["plan"]["steps"] = [{"tool": s.tool, "arg": s.arg,
                                            "expect": format_spec(s.expect)}
                                           for s in plan.steps]
@@ -987,13 +1151,38 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
             # A verified goal with no answer is not a completion. Found live: the
             # model replied `FINAL:` and nothing else, and the run reported
             # success with an empty answer because the goal condition held.
+            #
+            # Failing straight away was the second measured defect in the same
+            # place: the success arm's second live run collected a confirmed step,
+            # the goal condition held over it, and the model then sent a bare
+            # `FINAL:` — so a run that had already earned its evidence was thrown
+            # away over missing text. Asking once cannot manufacture evidence (the
+            # gate still reads only what the tools returned), so the repair is
+            # free of the risk that made `empty_answer` a failure in the first
+            # place, and the counter is bounded like every other retry here.
             if goal_ok and "FINAL:" in content:
                 answer = content.split("FINAL:", 1)[1].strip()
                 if not answer:
+                    retries = int(t.get("empty_answer_retries", 1))
+                    if stats["empty_answers"] < retries:
+                        stats["empty_answers"] += 1
+                        guard.note("empty_answer_retry",
+                                   {"attempt": stats["empty_answers"],
+                                    "retries": retries,
+                                    "verified_steps": stats["verified_steps"]},
+                                   step=stats["steps_used"])
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append({"role": "user", "content":
+                                         "GOAL-CHECK `%s` holds over the tool output you "
+                                         "collected, but your reply carried no answer "
+                                         "text. Reply with ONLY `FINAL: <your answer>`."
+                                         % format_spec(plan.goal_check)})
+                        continue
                     verdict, line = _failure(
                         guard, "empty_answer",
                         {"goal_check": format_spec(plan.goal_check),
                          "verified_steps": stats["verified_steps"],
+                         "retries": retries,
                          "claim": content[:200]},
                         stats["steps_used"], run_id, stats)
                     stats["failure"], stats["reason"] = line, "empty_answer"

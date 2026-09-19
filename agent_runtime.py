@@ -75,6 +75,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -393,15 +394,50 @@ def _is_tool_line(ln):
     return ln.strip().lstrip("<").startswith("TOOL:")
 
 
+# A FINAL answer is complete when it ends at a sentence or line boundary. Used
+# instead of "stop the moment `FINAL:` appears", which is the same care the tool
+# directive already gets (its line is only cut once the line ends). The negative
+# lookbehind holds a terminator that follows a digit: `0.` is a decimal still
+# streaming, not a sentence.
+_ANSWER_DONE_RE = re.compile(r"(?:\n\s*$)|(?:(?<![0-9])[.!?]\s*$)")
+
+
 def _stream_stop(content):
-    """Early-stop predicate for streaming: return True as soon as the model has
-    committed to a FINAL answer or completed a tool-directive line. The tool
-    call is only cut once its line ends (newline, >>>, or natural completion),
-    so the argument is never truncated."""
+    """Early-stop predicate for streaming: return True once the model has
+    committed to a *complete* FINAL answer or a completed tool-directive line.
+
+    The tool call is only cut once its line ends (newline, >>>, or natural
+    completion), so the argument is never truncated. FINAL gets the same rule, and
+    did not use to: stopping on the marker itself cut the stream at `FINAL:` before
+    the answer arrived — measured live (2026-09-19), every completion came back as
+    `FINAL:` at **2 tokens**, which the gate then read as `empty_answer` and failed
+    four runs that had already collected independently confirmed evidence. The
+    marker is not the answer; a sentence or line boundary after it is.
+
+    And a sentence boundary is not always one: measured live (same day, the
+    `nameable` arm) the model answered `FINAL: 0.25` — the correct value, in two runs
+    of four — and this predicate stopped the stream at the **decimal point**,
+    returning `FINAL: 0.`, which the gate then refused as no answer at all. A
+    terminator directly after a digit is ambiguous with a number still arriving, so
+    it is held and the model ends its own reply.
+
+    Bias deliberately towards stopping late: a late stop costs tokens, and an
+    early one returns a truncated answer, which is indistinguishable from having
+    no answer at all.
+    """
     if "FINAL:" in content:
-        return True
+        tail = content.split("FINAL:", 1)[1]
+        if not tail.strip():
+            return False
+        return bool(_ANSWER_DONE_RE.search(tail))
     lines = content.split("\n")
     last = lines[-1].strip().lstrip("<")
+    if content.endswith("\n") and len(lines) > 1:
+        # A trailing newline leaves an empty final element, and the completed
+        # directive is the line before it. Without this the bare `TOOL:` form — the
+        # one the docstring says phone-size models actually emit — never
+        # early-stopped at all.
+        last = lines[-2].strip().lstrip("<")
     if not _is_tool_line(last):
         return False
     line_complete = content.endswith("\n") or ">>>" in content

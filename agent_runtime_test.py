@@ -40,6 +40,7 @@ from agent_runtime import (
     QIH_OBJECTIVE,
     _emit_step,
     _gate_activation,
+    _stream_stop,
     activate_qih,
     run_goal,
 )
@@ -602,6 +603,54 @@ class QihResidenceTest(unittest.TestCase):
         env = {"DRIVE_RESIDENCE": "freebrain-residence", "QIH_RESIDENCE": "qih-residence"}
         self.assertEqual(os.path.basename(agent_runtime.residence_path(env)), "freebrain-residence")
         self.assertEqual(os.path.basename(agent_runtime.qih_residence(env)), "qih-residence")
+
+
+class StreamStopTest(unittest.TestCase):
+    """The early-stop predicate must never cut an answer short.
+
+    Regression, measured live 2026-09-19: `_stream_stop` returned True the moment
+    `FINAL:` appeared anywhere in the streamed text, so the stream was cut at the
+    marker — every live completion arrived as `FINAL:` and 2 tokens, the loop read
+    it as `empty_answer`, and four runs that had already collected independently
+    confirmed evidence were failed over missing text. The mirror of the tool-case
+    rule this predicate already had: cut a directive when its line ends, and cut an
+    answer when its sentence or line ends.
+    """
+
+    def test_the_marker_alone_is_not_a_complete_answer(self):
+        self.assertFalse(_stream_stop("FINAL:"))
+        self.assertFalse(_stream_stop("FINAL:   "))
+        self.assertFalse(_stream_stop("FINAL: the"))
+        # No boundary yet: stopping late costs tokens, stopping early loses the
+        # answer, so a bare filename is not treated as finished.
+        self.assertFalse(_stream_stop("FINAL: agent_runtime.py"))
+
+    def test_a_complete_answer_is_cut(self):
+        self.assertTrue(_stream_stop("FINAL: agent_runtime.py is present."))
+        self.assertTrue(_stream_stop("FINAL: yes!\n"))
+        self.assertTrue(_stream_stop("FINAL: which file?"))
+        self.assertTrue(_stream_stop("FINAL: the file is\nagent_runtime.py\n"))
+
+    def test_a_decimal_point_is_not_a_sentence_boundary(self):
+        # Measured live (same day, `nameable` arm): the model answered `FINAL: 0.25`
+        # — the correct value, in two runs of four — and the predicate cut the
+        # stream at the decimal point, so the gate received `FINAL: 0.` and refused a
+        # run that had already verified its evidence. A terminator directly after a
+        # digit is held, and the model ends its own reply.
+        self.assertFalse(_stream_stop("FINAL: 0."))
+        self.assertFalse(_stream_stop("FINAL: 0.25"))
+        self.assertFalse(_stream_stop("FINAL: recall_min_score is 0.25"))
+        # The cost of holding: a period right after a digit is not cut either.
+        self.assertFalse(_stream_stop("FINAL: the value is 0."))
+        # A line end is unambiguous, and prose after a decimal still ends a sentence.
+        self.assertTrue(_stream_stop("FINAL: 0.25\n"))
+        self.assertTrue(_stream_stop("FINAL: recall_min_score is 0.25, per the file."))
+
+    def test_a_tool_directive_is_still_cut_at_the_end_of_its_line(self):
+        self.assertTrue(_stream_stop("<<<TOOL:list_dir .>>>"))
+        self.assertTrue(_stream_stop("TOOL:read_file ./notes.md\n"))
+        # Mid-line, so the argument is never truncated.
+        self.assertFalse(_stream_stop("<<<TOOL:read_file ./not"))
 
 
 class ReflexEvidenceGateTest(unittest.TestCase):

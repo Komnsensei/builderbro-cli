@@ -99,6 +99,14 @@ DEFAULT_THRESHOLDS = {
     "task_token_budget": 0,
     # Times a malformed plan is sent back for repair before `plan_invalid`.
     "plan_repair_attempts": 1,
+    # Token ceiling for a plan call. 512 was enough for the plan text and not
+    # enough for the deliberation: measured live, `openai/gpt-oss-120b` returned
+    # 512/512 tokens with no content at all, then produced the plan in 1,099. A
+    # cap is a ceiling rather than a bill, so the cost of raising it is bounded by
+    # what the model actually writes — and the cost of leaving it low is a
+    # guaranteed wasted call plus an escalated retry on the provider this repo's
+    # cascade actually reaches.
+    "plan_max_tokens": 2048,
     # Accepted REPLANs before `replan_storm`.
     "max_replans": 2,
     # Off-plan actions tolerated (recorded, not fatal) before `plan_divergence`.
@@ -110,6 +118,12 @@ DEFAULT_THRESHOLDS = {
     # token budget without emitting content, or a dropped stream, produces one; the
     # first is usually transient and killing the run throws away a paid-for plan.
     "empty_response_retries": 1,
+    # Times a verified goal with an empty answer is sent back for the text before
+    # `empty_answer` is raised. Measured live: the model collected a confirmed step,
+    # the goal condition held, and it sent a bare `FINAL:` — so the run was one
+    # turn from success and the whole thing was discarded. Asking cannot create
+    # evidence (the gate reads only tool output), so this is bounded, not relaxed.
+    "empty_answer_retries": 1,
     # Cap a retry may use when the previous reply was empty AND had consumed its
     # whole cap — a budget signal rather than a dropped stream, since a dropped
     # stream does not bill tokens. Measured against the cascade's default hosted

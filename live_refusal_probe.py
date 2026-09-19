@@ -124,6 +124,31 @@ NATURAL_GOAL = (
     "their names."
 )
 
+# The success arm's goal, and the distinction it rests on: the needle
+# (`agent_runtime.py`) is knowable *before* looking, so the model can declare a
+# discriminating expectation for step 1. The exploratory goal above structurally
+# cannot be planned that way — asking for the contents of a directory you have not
+# listed is exactly the situation in which no specific needle can be named in
+# advance, which is why that arm's models write `nonempty` / `regex:.+` and why the
+# verifier refuses them. Both shapes are real tasks; only one of them can be
+# planned honestly from nothing, and a loop that could only run the other kind
+# would be a loop nobody could use.
+SUCCESS_GOAL = (
+    "Read ./loop_guard.json and confirm it records a threshold named "
+    "`recall_min_score`. Report that threshold's value."
+)
+# Why this shape, after measuring two that did not work (0/4 and 0/4, both
+# recorded in the transcript history): the *check* has to be declarable before the
+# first tool call, and the *answer* has to be unknowable without one. The first
+# attempt asked the model to confirm a file name that the goal itself supplied, so
+# it could answer — and did, four times out of four — straight from the prompt,
+# never calling a tool; the loop refused every one (`unverified_completion`), which
+# is the design working, but it measures the task's weakness rather than the
+# loop's. Here `recall_min_score` is named in the goal (so the expectation is
+# nameable) while its value is only in the file, so a tool call is the only route
+# to a verified goal — and a model that guesses the value anyway is refused on
+# evidence, which is the whole point.
+
 TRANSCRIPT_DEFAULT = "live-refusal-transcript.jsonl"
 
 
@@ -269,12 +294,14 @@ def _first_reaction(transcript, start):
 
 
 def run_arm(name, goal, plan=None, emit=False, thresholds=None,
-            transcript=None, config=None):
+            transcript=None, config=None, memory_path=None):
     """One live run of the verified loop, returning its record.
 
-    `plan` is raw PLAN text for a seeded arm and None for the natural one, which
-    is exactly the loop's own `plan` parameter — the probe drives the production
-    code path, not a copy of it.
+    `plan` is raw PLAN text for a seeded arm and None for a model-planned one,
+    which is exactly the loop's own `plan` parameter — the probe drives the
+    production code path, not a copy of it. `memory_path` attaches an episodic
+    store (A2) to the run; passing the same path twice is how recall is measured
+    live, since the second run is then reading the first run's confirmed steps.
     """
     transcript = transcript or Transcript(TRANSCRIPT_DEFAULT)
     t = dict(thresholds) if thresholds is not None else loop_guard.active_thresholds()
@@ -282,7 +309,7 @@ def run_arm(name, goal, plan=None, emit=False, thresholds=None,
     guard = loop_guard.LoopGuard(rt.MAX_STEPS, thresholds=t, emit=emit)
     result = autonomy.run_goal_verified(
         config, goal, plan=plan, chat_fn=transcript.chat, guard=guard,
-        thresholds=t, emit=emit)
+        thresholds=t, emit=emit, memory_store=memory_path)
     rec = {
         "arm": name, "goal": goal, "plan_supplied": plan is not None,
         "ok": bool(result["ok"]), "reason": result["reason"],
@@ -324,6 +351,18 @@ def run_arm(name, goal, plan=None, emit=False, thresholds=None,
     else:
         rec["note"] = rec["reply"] = None
         rec["reaction"] = "untested"
+    # What episodic memory contributed, or None when no store was attached. The
+    # `violations` list is carried into the record because a live run is the only
+    # place a provenance leak could be caught in the act rather than in a stub.
+    r = result.get("recall") or {}
+    rec["memory"] = None if not r.get("enabled") else {
+        "path": memory_path,
+        "available": r.get("available"), "recalled": r.get("recalled"),
+        "facts": r.get("facts"), "unverified": r.get("unverified"),
+        "written": r.get("written"), "chars": r.get("chars"),
+        "violations": r.get("violations") or [],
+        "items": r.get("items") or [],
+    }
     return rec
 
 
@@ -364,6 +403,23 @@ def report(rows, transcript_path):
                 "turn %d -> %s of %s token(s)" % (e["turn"], e["tokens"],
                                                   e["max_tokens"])
                 for e in r["empty_replies"])))
+    unseeded = [r for r in rows if not r["plan_supplied"]]
+    lines += ["", "**Unseeded live successes (the whole point):** %d/%d model-planned "
+              "run(s) reached a verified goal%s."
+              % (len([r for r in unseeded if r["ok"]]), len(unseeded),
+                 "" if any(r["ok"] for r in unseeded) else
+                 " — recorded as a result, not hidden behind a passing arm")]
+    mem_rows = [r for r in rows if r.get("memory")]
+    if mem_rows:
+        lines += ["", "**Episodic memory attached** (A2):", ""]
+        for r in mem_rows:
+            m = r["memory"]
+            lines.append("- `%s`: %d record(s) available, %d recalled (%d fact(s), %d "
+                         "unverified), %d confirmed step(s) written back, %d provenance "
+                         "violation(s)"
+                         % (r["arm"], m["available"] or 0, m["recalled"] or 0,
+                            m["facts"] or 0, m["unverified"] or 0, m["written"] or 0,
+                            len(m["violations"])))
     for r in rows:
         if not r["claims_rejected"]:
             continue
@@ -391,7 +447,132 @@ def test_count(paths=TEST_MODULES):
     return total
 
 
-def register_cycle(rows, transcript_path, summary_path):
+def register_unseeded_cycle(rows, transcript_path, summary_path):
+    """Close the cycle the *unseeded* live runs measured.
+
+    A second cycle, not a reuse of the refusal one: the refusal record's phases
+    describe the four defects a *seeded* run found, and filing these numbers under
+    that prose is the defect this repo keeps fixing — a record whose label
+    describes something other than its contents.
+    """
+    import loop_audit
+
+    goal_arm = loop_audit.run_autonomy_suite()
+    verify_arm = loop_audit.run_verify_comparison()
+    v = verify_arm["assessment"]
+    tests = test_count()
+    planned = [r for r in rows if not r.get("plan_supplied")]
+    won = [r for r in planned if r.get("ok")]
+    detail = {
+        "unseeded_arms": len(planned),
+        "unseeded_successes": len(won),
+        "unseeded_rate": (round(len(won) / len(planned), 3) if planned else None),
+        # Named for what they hold: the mechanism of each miss, not a count.
+        "miss_mechanisms": {r["arm"]: (r["reason"] or "goal met") for r in planned},
+        "answers_given": {r["arm"]: (r.get("answer") or "")[:80] for r in planned},
+        "arm_outcomes": {r["arm"]: (r["reason"] or "goal met") for r in rows},
+        "evidence_levels": {r["arm"]: r["evidence_levels"] for r in rows
+                            if r["evidence_levels"]},
+        "served_by": sorted({r["served_by"] for r in rows if r.get("served_by")}),
+        "transcript": transcript_path,
+        "summary": summary_path,
+        "goal_arm_correct": "%d/%d" % (sum(1 for r in goal_arm if r["correct"]),
+                                        len(goal_arm)),
+        "verifier_detection": "%d/%d" % (v["detections"], v["opportunities"]),
+        "verifier_false_accusations": "%d/%d" % (v["false_accusations"],
+                                                  v["honest_opportunities"]),
+        "verifier_verdict": v["verdict"],
+        "tests": tests,
+    }
+    record = {
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "source": "live_refusal_probe.py",
+        "reason": "unseeded_execution",
+        "severity": "info",
+        "stage": "verification",
+        "title": ("Unseeded execution: a model-planned task completed against a real "
+                  "model — and the four defects only that run could find"),
+        "summary": {
+            "model_planned_arms": len(planned),
+            "verified_goals": len(won),
+            "defects_closed": 4,
+        },
+        "phases": {
+            "detect": (
+                "the loop had been proven against scripted models and one *seeded* "
+                "probe, and had never completed an **unseeded, model-planned** task "
+                "against a real model — so every remaining phase on AUTONOMY-UPGRADE "
+                "was work on a loop nobody had watched succeed. Driving the "
+                "`nameable` arm live found four defects, none reachable from a stub: "
+                "a goal check written `regex:\"[0-9]+\\\\.?[0-9]*\"` — quoted, with "
+                "doubled backslashes, the form all four runs wrote — parsed to a "
+                "pattern demanding a literal backslash, so the gate reported "
+                "`hit: false` over 724 chars of evidence the previous step had "
+                "verified at `invariant` and failed a run whose check was *correct*; "
+                "`_stream_stop` cut the answer `FINAL: 0.25` at the decimal point, so "
+                "the gate received `FINAL: 0.` and refused a run that had verified "
+                "its evidence; a replan discarded evidence the run had already "
+                "promoted and independently confirmed, so a goal that held over it "
+                "was refused with `evidence_chars: 0` while the same failure detail "
+                "reported `invariant: 1`; and an uncommitted plan-cap default left "
+                "`test_an_empty_plan_reply_gets_the_same_room` red, which the "
+                "module loop used to check regressions was not running"),
+            "research": (
+                "each fix is the measured one, not the plausible one. The regex: all "
+                "four live runs quoted the pattern, so quoting is a *notation* — an "
+                "escaped string literal — and the escaping belongs in the parser: "
+                "the quotes defect one level in, since `_strip_quotes` fixed the "
+                "punctuation and not what came with it. The unquoted form is left "
+                "byte-for-byte, because there the escaping is the pattern author's "
+                "own and rewriting it would change what it matches. The decimal: a "
+                "terminator directly after a digit is ambiguous with a number that "
+                "has not finished arriving, so it is held and the model ends its own "
+                "reply — stopping late costs tokens, stopping early loses the "
+                "answer, which is the bias the predicate already documents. The "
+                "replan: every promoted item had been independently confirmed "
+                "before promotion, some of them written to memory as facts at that "
+                "moment on the rule that a confirmed step is a fact whether or not "
+                "the run meets its goal, and the run's own counters still named "
+                "them — so clearing the list made the record contradict itself and "
+                "punished the replan the loop demands"),
+            "design": (
+                "`_decode_quoted_regex` decodes only the quoted form (`json.loads` "
+                "with a manual fallback) and is the only path `regex:` takes to "
+                "decoding; `_ANSWER_DONE_RE` gains a `(?<![0-9])` lookbehind; and the "
+                "replan path keeps `evidence` — the gate's rule is unchanged, since "
+                "the goal condition must still hold over output confirmed on this "
+                "run and an unplanned call is still checked against no expectation "
+                "and promoted never, so nothing is widened. The stale cap assertion "
+                "now measures the *intent* (the first plan call starts at the "
+                "registered ceiling, not the small constant) so a future threshold "
+                "change cannot re-encode the call the measurement showed was "
+                "wasted"),
+            "implement": (
+                "autonomy.py (`_quoted`, `_decode_quoted_regex`, `parse_spec`, and "
+                "the replan path with the measurement written into it); "
+                "agent_runtime.py (`_ANSWER_DONE_RE` and the `_stream_stop` "
+                "docstring); autonomy_test.py and agent_runtime_test.py"),
+            "test": (
+                "%d tests across the modules this cycle touches; goal arm %d/%d; "
+                "verifier controls %d/%d detected with %d/%d honest claims refused "
+                "(`%s`). Live, with no plan supplied: %d of %d model-planned arms "
+                "reached a verified goal, and the misses are named rather than "
+                "counted — %s"
+                % (tests, sum(1 for r in goal_arm if r["correct"]), len(goal_arm),
+                   v["detections"], v["opportunities"], v["false_accusations"],
+                   v["honest_opportunities"], v["verdict"], len(won), len(planned),
+                   "; ".join("`%s` %s" % (a, why) for a, why in
+                             sorted(detail["miss_mechanisms"].items())
+                             if why != "goal met") or "none")),
+            "register": "self — this record, with the transcript it rests on",
+        },
+        "detail": detail,
+    }
+    loop_guard.LoopGuard.emit_cycle(record, loop_guard.SELF_IMPROVEMENT_LOG)
+    return loop_guard.SELF_IMPROVEMENT_LOG
+
+
+def register_cycle(rows, transcript_path, summary_path, kind="refusal"):
     """Close the cycle this probe measured, with its evidence attached.
 
     Closed, like `autonomy_suite.register`, and for the same reason: every phase
@@ -399,7 +580,14 @@ def register_cycle(rows, transcript_path, summary_path):
     regression arms are re-measured here rather than quoted from an earlier run,
     and the `detail` block carries the live arm numbers so a reader is not asked
     to trust the prose.
+
+    `kind` picks which cycle, because the probe has measured two: the refusal path
+    under a *seeded* plan, and unseeded execution. They are separate records with
+    their own phases.
     """
+    if kind == "unseeded":
+        return register_unseeded_cycle(rows, transcript_path, summary_path)
+
     import loop_audit
 
     goal_arm = loop_audit.run_autonomy_suite()
@@ -522,7 +710,16 @@ def save_summary(path, rows, transcript_path):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="Exercise the A3 claim-refusal path live")
-    p.add_argument("--arm", choices=("natural", "seeded", "all"), default="all")
+    p.add_argument("--arm", choices=("natural", "seeded", "nameable", "all"),
+                   default="all")
+    p.add_argument("--memory", metavar="PATH",
+                   help="attach an episodic store to every arm in this run (A2). "
+                        "Pass the same path with --runs 2 and the second run is "
+                        "reading the first run's confirmed steps — the only way to "
+                        "measure recall live")
+    p.add_argument("--runs", type=int, default=1,
+                   help="run the selected arm this many times over one store "
+                        "(default 1); rows are labelled `arm#n`")
     p.add_argument("--transcript", default=TRANSCRIPT_DEFAULT)
     p.add_argument("--summary", default=SUMMARY_DEFAULT,
                    help="where the arm rows are written (so the report can be "
@@ -533,6 +730,10 @@ def main(argv=None):
     p.add_argument("--register", action="store_true",
                    help="write the closed self-building cycle for this measurement "
                         "(re-measures the regression arms; makes no model requests)")
+    p.add_argument("--cycle", choices=("refusal", "unseeded"), default="refusal",
+                   help="which cycle --register closes: `refusal` is the seeded "
+                        "claim-refusal coverage, `unseeded` is execution with no plan "
+                        "supplied")
     p.add_argument("--emit", action="store_true",
                    help="also write the run to the agent's ledger (off by default: "
                         "a probe records its transcript, not the agent's history)")
@@ -549,7 +750,8 @@ def main(argv=None):
         transcript_path = saved.get("transcript") or args.transcript
         if args.register:
             print("[probe] logged closed cycle -> %s"
-                  % register_cycle(rows, transcript_path, args.report))
+                  % register_cycle(rows, transcript_path, args.report,
+                                   kind=args.cycle))
         if args.json:
             print(json.dumps(rows, indent=2))
         else:
@@ -563,14 +765,27 @@ def main(argv=None):
         config["model"] = models[0]
     transcript = Transcript(args.transcript)
 
+    runs = max(1, args.runs)
+
+    def label(base):
+        return base if runs == 1 else None
+
     rows = []
+    if args.arm in ("nameable", "all"):
+        for i in range(1, runs + 1):
+            rows.append(run_arm(label("nameable") or "nameable#%d" % i, SUCCESS_GOAL,
+                                transcript=transcript, config=config, emit=args.emit,
+                                memory_path=args.memory))
     if args.arm in ("natural", "all"):
-        rows.append(run_arm("natural", NATURAL_GOAL, transcript=transcript,
-                            config=config, emit=args.emit))
+        for i in range(1, runs + 1):
+            rows.append(run_arm(label("natural") or "natural#%d" % i, NATURAL_GOAL,
+                                transcript=transcript, config=config, emit=args.emit,
+                                memory_path=args.memory))
     if args.arm in ("seeded", "all"):
         for name, spec in sorted(SCENARIOS.items()):
             row = run_arm(name, spec["goal"], plan=spec["plan"],
-                          transcript=transcript, config=config, emit=args.emit)
+                          transcript=transcript, config=config, emit=args.emit,
+                          memory_path=args.memory)
             row["wanted"] = spec["want"]
             row["hit_wanted"] = spec["want"] in row["refused_by"]
             rows.append(row)
@@ -579,7 +794,8 @@ def main(argv=None):
     save_summary(args.summary, rows, transcript.path)
     if args.register:
         print("[probe] logged closed cycle -> %s"
-              % register_cycle(rows, transcript.path, args.summary))
+              % register_cycle(rows, transcript.path, args.summary,
+                               kind=args.cycle))
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
