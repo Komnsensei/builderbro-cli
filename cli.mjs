@@ -11,7 +11,7 @@ import { createConnection } from "net";
 import { createRequire } from "module";
 import { buildWizard } from "./bro-build.mjs";
 import { WEB_TOOLS } from "./bro-web.mjs";
-import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, formatModelList, modelPreferencePath } from "./model-selector.mjs";
+import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, formatModelList, modelPreferencePath, localModelConfig, chatLocal, pingLocal, localModelLabel } from "./model-selector.mjs";
 import { fileURLToPath } from "url";
 
 const require = createRequire(import.meta.url);
@@ -82,6 +82,10 @@ var TOKEN=process.env.BASE44_TOKEN||"";
 var GROQ_KEY=process.env.GROQ_API_KEY||"";
 var tgPollTimer=null;
 var tgBase="";
+// Local open-weight backend (Ollama / vLLM / llama.cpp) — when configured,
+// askChat runs fully offline with zero cloud API calls. See model-selector.mjs.
+var LOCAL_CFG=localModelConfig();
+var LOCAL_FALLBACK=process.env.BRO_LOCAL_FALLBACK==="1";
 
 // saveTgGroups and registerTgChat are defined later in this file
 var TG_GROUPS_F=join(DATA_DIR,"telegram_groups.json");
@@ -1693,6 +1697,7 @@ var ENDPOINTS=[
   {id:"base44",name:"Base44 API",url:"https://base44.app/api/apps/"+APP+"/agents/conversations",headers:{"Content-Type":"application/json","X-App-Id":APP,"Authorization":"Bearer "+TOKEN}},
   {id:"groq",name:"Groq LLM",url:"https://api.groq.com/openai/v1/models",headers:{"Authorization":"Bearer "+GROQ_KEY}}
 ];
+if(LOCAL_CFG)ENDPOINTS.push({id:"local",name:"Local open-weight",url:LOCAL_CFG.url+"/models",headers:{"Authorization":"Bearer "+LOCAL_CFG.key}});
 
 async function runHeartbeat(silent){
   var results=[];
@@ -1909,9 +1914,74 @@ function detectGcpProjectId(){
   return "";
 }
 
+function vertexTokenOwner(token){
+  if(!token) return "(no token cached - gcloud auth missing)";
+  try{
+    var payload = JSON.parse(Buffer.from(token.split(".")[1],"base64").toString());
+    var who = payload.email || payload.client_email || (payload.iss?"account from "+payload.iss:"unknown");
+    var exp = payload.exp?"expires "+new Date(payload.exp*1000).toUTCString():"no expiry";
+    return who+" ("+exp+")";
+  }catch(e){ return "(token present but not a decodable JWT)"; }
+}
+
+function buildVertex403Message(errBody, projectId, region, model){
+  var detail = "";
+  try{ detail = (JSON.parse(errBody).error||{}).message || ""; }catch(e){ detail = errBody || ""; }
+  var lines = [
+    "Vertex API rejected payload: 403 - request denied",
+    "  Project: "+projectId,
+    "  Region:  "+region,
+    "  Model:   "+model,
+    "  Account: "+vertexTokenOwner(cachedVertexToken)
+  ];
+  if(detail) lines.push("  Reason:  "+detail);
+  lines.push("");
+  if(/dunning/i.test(detail)){
+    lines.push("This is a BILLING block, not a code or auth problem. Google paused Vertex AI");
+    lines.push("for this project over an unpaid balance (\"dunning\" = collections). No local");
+    lines.push("fix works until it is resolved in the Google Cloud console:");
+    lines.push("  -> console.cloud.google.com/billing  (pick project '"+projectId+"', clear the balance)");
+    lines.push("  -> then re-enable the Vertex AI API on that project");
+  } else if(/permission|forbidden|not authorized/i.test(detail)){
+    lines.push("The account above does not have Vertex access on this project. Fix with:");
+    lines.push("  gcloud auth login");
+    lines.push("  gcloud config set project "+projectId+"   (or the project that owns your billing)");
+    lines.push("If the account looks wrong, log out and log in with the account that owns the project.");
+  } else {
+    lines.push("Generic 403. Verify the Vertex AI API is enabled and billing is active on:");
+    lines.push("  gcloud config get-value project   (currently: "+projectId+")");
+  }
+  return lines.join("\n");
+}
+
 async function askChat(chatHistory, ret, abortSignal){
   ret=ret||3;
   stats.apiCalls++;
+
+  // Local open-weight path (Phase 0 / FREE-BRAIN.md): when LOCAL_MODEL_URL is
+  // configured, BRO talks only to the local server — zero cloud API calls.
+  // BRO_LOCAL_FALLBACK=1 re-enables the cloud path if the local server fails.
+  if (LOCAL_CFG) {
+    for(var li=0;li<ret;li++){
+      try{
+        var lr=await chatLocal(LOCAL_CFG, chatHistory, { system: buildSys(), signal: abortSignal });
+        if(lr.tokens) stats.totalTokens += lr.tokens;
+        saveStat();
+        return lr;
+      }catch(e){
+        if(abortSignal && abortSignal.aborted){
+          var stopErr=new Error("Stopped by user");
+          stopErr.userStopped=true;
+          throw stopErr; // never retry a user-initiated stop
+        }
+        if(li===ret-1){
+          if(!LOCAL_FALLBACK){ stats.errors++; saveStat(); throw e; }
+          break; // fall through to the cloud path below
+        }
+        await sleep((li+1)*2000);
+      }
+    }
+  }
 
   if (!cachedVertexToken) refreshVertexToken(); // never set via env - try gcloud once
   if (!cachedGcpProjectId) detectGcpProjectId(); // ditto for the project id
@@ -1956,8 +2026,11 @@ async function askChat(chatHistory, ret, abortSignal){
           continue;
         }
         var errBody = "";
-        try { errBody = " - " + await r.text(); } catch(_) {}
-        throw new Error("Vertex API rejected payload: " + r.status + errBody);
+        try { errBody = await r.text(); } catch(_) {}
+        if(r.status===403){
+          throw new Error(buildVertex403Message(errBody, PROJECT_ID, REGION, MODEL));
+        }
+        throw new Error("Vertex API rejected payload: " + r.status + (errBody?" - "+errBody:""));
       }
       
       var d=await r.json();
@@ -2144,11 +2217,645 @@ patch:function(a){
       if(action==="file"){var fp=rest.split(" ");return await ghFile(fp[0], fp.slice(1).join(" "));}
       return "ERR: unknown github action \""+action+"\". Use one of: repo, prs, issues, checks, file OWNER/REPO PATH";
     }catch(e){ return "ERR: "+e.message; }
+  },
+  scar:async function(a){
+    var text=a||"";
+    var runtime=globalThis.__broRuntime;
+    if(!runtime){ return "ERR: scar memory runtime not loaded."; }
+    if(!runtime.scarEntry && !runtime.recallScar && !runtime.scarCostReport){ return "ERR: scar memory not loaded."; }
+    var parts=text.trim().split(/\s+/);
+    var cmd=parts[0]&&parts[0].toLowerCase();
+    if(cmd==="recall"||cmd==="search"){
+      var q=parts.slice(1).join(" ");
+      var hits=runtime.recallScar(q,{depth:"deep"});
+      if(!hits.length) return "no matching scar found.";
+      return hits.slice(0,20).map(function(h){
+        return "["+(h.scar||"open")+" • w"+(h.weight||0).toFixed(0)+" • cost"+(h.cost||0).toFixed(0)+""+(h.protected?" • protected":"")+"] "+(h.text||"").substring(0,300)+"\n   residue: "+(h.residue||"");
+      }).join("\n");
+    }
+    if(cmd==="surface"||cmd==="context"){
+      var q=parts.slice(1).join(" ");
+      return runtime.scarSurface(q);
+    }
+    if(cmd==="mark"||cmd==="scars"){
+      var target=parts.slice(1).join(" ").split(/ +(?:open|raw|healed|sealed|protected|sacred)$/)[0].trim();
+      var state=(parts.slice(1).join(" ").match(/(open|raw|healed|sealed|protected|sacred)$/)||[])[0] || "open";
+      if(!target) return "ERR: target required.";
+      return runtime.scarMark(target,state);
+    }
+    if(cmd==="heal"||cmd==="dull"){
+      var target=parts.slice(1).join(" ").split(/ +(?:dull|smooth|patch|heal)$/)[0].trim();
+      var how=(parts.slice(1).join(" ").match(/(dull|smooth|patch|heal)$/)||[])[0] || "dull";
+      if(!target) return "ERR: target required.";
+      return runtime.scarHeal(target,how);
+    }
+    if(cmd==="seal"||cmd==="protect"){
+      var target=parts.slice(1).join(" ").trim();
+      if(!target) return "ERR: target required.";
+      return runtime.scarSeal(target);
+    }
+    if(cmd==="reopen"||cmd==="open"){
+      var target=parts.slice(1).join(" ").trim();
+      if(!target) return "ERR: target required.";
+      return runtime.scarReopen(target);
+    }
+    if(cmd==="cost"||cmd==="weight"){
+      var target=parts.slice(1).join(" ").split(/ +[+-]?\d+$/)[0].trim();
+      var val=(parts.slice(1).join(" ").match(/[+-]?\d+$/)||[])[0];
+      if(!target) return "ERR: target required.";
+      if(cmd==="weight") return runtime.scarWeigh(target, val?Number(val):1);
+      return runtime.scarCost(target, val?Number(val):0);
+    }
+    if(cmd==="report"||cmd==="status"||cmd==="attitude"){
+      return runtime.scarCostReport && runtime.scarCostReport();
+    }
+    if(typeof runtime.scarEntry === "function"){
+      return runtime.scarEntry(text, {});
+    }
+    return "ERR: scar entry not available.";
   }
 };
 
 // Wire up the agentic web browsing engine (bro-web.mjs)
 Object.assign(TOOLS, WEB_TOOLS);
+
+// ── AGENT RUNTIME CORE ──────────────────────────────────────────────────────────
+// Long-running, multi-session autonomous agent layer.
+// Same agent key across terminals. Each terminal gets its own session.
+// Global persistent memory + per-session continuity.
+// On-the-fly tool creation persists so roadblocks can be cleared and reused.
+(function agentRuntimeCore(){
+  var fg = typeof rgb === "function" ? rgb : function(){ return ""; };
+  var R = typeof RST === "string" ? RST : "\x1b[0m";
+  var B = typeof BOLD === "string" ? BOLD : "\x1b[1m";
+  var D = typeof DIM === "string" ? DIM : "\x1b[2m";
+
+  // ── THEME SYSTEM ──────────────────────────────────────────────────────────────
+  // blue, purple, yellow, green, red — plus agent-state tints.
+  var THEMES = {
+    blue:   { name:"blue",   ink:[120,180,255], paper:[10,20,40], accent:[80,200,255], glow:[60,120,255], note:[150,200,255] },
+    purple: { name:"purple", ink:[220,170,255], paper:[20,5,40], accent:[180,100,255], glow:[140,40,200], note:[200,180,255] },
+    yellow: { name:"yellow", ink:[255,230,120], paper:[30,25,10], accent:[255,200,50], glow:[255,160,20], note:[255,225,170] },
+    green:  { name:"green",  ink:[140,255,160], paper:[5,30,15], accent:[80,255,120], glow:[40,180,80], note:[160,255,180] },
+    red:    { name:"red",    ink:[255,120,120], paper:[40,10,10], accent:[255,80,80], glow:[200,40,40], note:[255,170,170] }
+  };
+
+  var ACTIVE_THEME = THEMES.purple;
+  var THEME_FILE = join(DATA_DIR, "theme.json");
+  try {
+    var persisted = JSON.parse(readFileSync(THEME_FILE, "utf8"));
+    if (persisted && THEMES[persisted]) ACTIVE_THEME = THEMES[persisted];
+  } catch(e) {}
+
+  function saveThemeName() {
+    try { writeFileSync(THEME_FILE, JSON.stringify({ theme: ACTIVE_THEME.name }), "utf8"); } catch(e) {}
+  }
+
+  function setTheme(name) {
+    if (!THEMES[name]) return "ERR: unknown theme. Use: blue, purple, yellow, green, red.";
+    ACTIVE_THEME = THEMES[name];
+    saveThemeName();
+    return "Theme set to " + name + ".";
+  }
+
+  function themeStatus() {
+    return "Current theme: " + ACTIVE_THEME.name + ". Available: blue, purple, yellow, green, red.";
+  }
+
+  // ── SESSION IDENTITY ───────────────────────────────────────────────────────────
+  // One key, many terminals. Each terminal gets its own session id.
+  // Auto-generated by default, optionally named.
+  var SESSIONS_DIR = join(DATA_DIR, "sessions");
+  try { mkdirSync(SESSIONS_DIR, { recursive:true }); } catch(e) {}
+
+  var SESSION_ID = String(process.env.BRO_SESSION_ID || process.pid + "-" + Date.now() + "-" + Math.random().toString(36).slice(2,7));
+  var SESSION_NAME = String(process.env.BRO_SESSION_NAME || "");
+  var SESSION_F = join(SESSIONS_DIR, SESSION_ID + ".json");
+
+  var sessionState;
+  try {
+    sessionState = JSON.parse(readFileSync(SESSION_F, "utf8"));
+  } catch(e) {
+    sessionState = { id: SESSION_ID, name: SESSION_NAME, started: Date.now(), turns: 0, lastInput: "", continuity: [] };
+  }
+
+  function saveSessionState() {
+    try {
+      sessionState.turns = (sessionState.turns||0) + 1;
+      writeFileSync(SESSION_F, JSON.stringify(sessionState, null, 2), "utf8");
+    } catch(e) {}
+  }
+
+  function sessionInfo() {
+    var name = sessionState.name || SESSION_ID;
+    var started = new Date(sessionState.started).toISOString().replace(/T/, " ").substring(0,19);
+    return "Session: " + name + "\n  id: " + SESSION_ID + "\n  started: " + started + "\n  turns: " + (sessionState.turns||0);
+  }
+
+  // ── GLOBAL PERSISTENT MEMORY + PER-SESSION CONTINUITY ─────────────────────────
+  // Global memory is shared across all sessions/terminals.
+  // Continuity is per-session and survives restarts in this terminal.
+  var GLOBAL_MEM_F = join(DATA_DIR, "global_memory.json");
+  var globalMem;
+  try { globalMem = JSON.parse(readFileSync(GLOBAL_MEM_F, "utf8")); } catch(e) {
+    globalMem = { facts: [], observations: [], decisions: [], errors: [], created: Date.now() };
+  }
+
+  function saveGlobalMem() {
+    try { writeFileSync(GLOBAL_MEM_F, JSON.stringify(globalMem, null, 2), "utf8"); } catch(e) {}
+  }
+
+  function memorizeGlobal(type, text, meta) {
+    if (!text) return;
+    var entry = { t: Date.now(), type: type, text: String(text), meta: meta || {} };
+    if (type === "fact") globalMem.facts.push(entry);
+    else if (type === "decision") globalMem.decisions.push(entry);
+    else if (type === "error") globalMem.errors.push(entry);
+    else globalMem.observations.push(entry);
+    if (globalMem.facts.length > 500) globalMem.facts.splice(0, globalMem.facts.length - 500);
+    if (globalMem.observations.length > 800) globalMem.observations.splice(0, globalMem.observations.length - 800);
+    if (globalMem.decisions.length > 200) globalMem.decisions.splice(0, globalMem.decisions.length - 200);
+    if (globalMem.errors.length > 300) globalMem.errors.splice(0, globalMem.errors.length - 300);
+    saveGlobalMem();
+  }
+
+  function globalMemoryContext() {
+    var ctx = "";
+    if (globalMem.facts.length) ctx += "Known facts:\n" + globalMem.facts.slice(-8).map(function(f){ return "- " + f.text; }).join("\n") + "\n";
+    if (globalMem.observations.length) ctx += "Recent context:\n" + globalMem.observations.slice(-8).map(function(o){ return "- " + o.text; }).join("\n") + "\n";
+    if (globalMem.decisions.length) ctx += "Decisions:\n" + globalMem.decisions.slice(-6).map(function(d){ return "- " + d.text; }).join("\n") + "\n";
+    return ctx;
+  }
+
+  // Per-session continuity: short-lived transcript + last context anchors.
+  if (!sessionState.continuity) sessionState.continuity = [];
+  function saveContinuity(text) {
+    if (!text) return;
+    sessionState.continuity.push({ t: Date.now(), text: String(text).substring(0, 400) });
+    if (sessionState.continuity.length > 40) sessionState.continuity.splice(0, sessionState.continuity.length - 40);
+    saveSessionState();
+  }
+
+  function sessionContinuityContext() {
+    if (!sessionState.continuity.length) return "";
+    return "Recent session continuity:\n" + sessionState.continuity.slice(-12).map(function(c){ return "- " + c.text; }).join("\n") + "\n";
+  }
+
+  // Keep the existing memory module working if it exists; otherwise use globalMem.
+  function memorize(type, text, meta) {
+    if (typeof moduleLevelMemorize === "function") moduleLevelMemorize(type, text, meta);
+    memorizeGlobal(type, text, meta);
+    saveContinuity("memorized: " + String(text).substring(0, 160));
+  }
+
+  // ── SCARRED MEMORY MODEL ──────────────────────────────────────────────────────────
+  // Memory is not a clean log. It is a living record with marks.
+  // Each remembered thing carries the shape of the event that made it,
+  // what it cost, what it changed, and how the agent should bear it.
+  var SCAR_MEMORY_F = join(DATA_DIR, "scar_memory.json");
+  var scarMemory = {
+    created: Date.now(),
+    entries: [],
+    attitude: {
+      base: "alert",
+      current: "alert",
+      woundCount: 0,
+      protectedCount: 0,
+      heaviness: 0,
+      caution: 0,
+      fire: 0,
+      coldness: 0,
+      focus: 0
+    }
+  };
+  try { var persisted = JSON.parse(readFileSync(SCAR_MEMORY_F, "utf8")); if (persisted) Object.assign(scarMemory, persisted); } catch(e) {}
+  if (!scarMemory.entries) scarMemory.entries = [];
+  if (!scarMemory.attitude) scarMemory.attitude = scarMemory.attitude || { base:"alert", current:"alert", woundCount:0, protectedCount:0, heaviness:0, caution:0, fire:0, coldness:0, focus:0 };
+
+  function saveScarMemory() {
+    try { writeFileSync(SCAR_MEMORY_F, JSON.stringify(scarMemory, null, 2), "utf8"); } catch(e) {}
+  }
+
+  function computeScarAttitude() {
+    var a = scarMemory.attitude;
+    var entries = scarMemory.entries || [];
+    var wounds = 0, protectedCount = 0, heaviness = 0, caution = 0, fire = 0, coldness = 0, focus = 0;
+    entries.forEach(function(e) {
+      var w = Number(e.weight || 0);
+      var scar = String(e.scar || "open");
+      var cost = Number(e.cost || 0);
+      var residue = String(e.residue || "").toLowerCase();
+      if (scar === "open" || scar === "raw") wounds++;
+      if (scar === "protected" || scar === "sealed" || scar === "sacred") protectedCount++;
+      heaviness += w + cost;
+      if (residue.indexOf("danger") >= 0 || residue.indexOf("betray") >= 0 || residue.indexOf("loss") >= 0) caution += 2;
+      if (residue.indexOf("fury") >= 0 || residue.indexOf("fire") >= 0 || residue.indexOf("hate") >= 0) fire += 2;
+      if (residue.indexOf("cold") >= 0 || residue.indexOf("numb") >= 0 || residue.indexOf("hollow") >= 0) coldness += 2;
+      if (residue.indexOf("focus") >= 0 || residue.indexOf("blade") >= 0 || residue.indexOf("clarity") >= 0) focus += 1;
+    });
+    a.woundCount = wounds;
+    a.protectedCount = protectedCount;
+    a.heaviness = Math.min(100, heaviness);
+    a.caution = Math.min(10, caution);
+    a.fire = Math.min(10, fire);
+    a.coldness = Math.min(10, coldness);
+    a.focus = Math.min(10, focus);
+    if (wounds > 3) a.current = "wounded";
+    else if (fire > 5) a.current = "fierce";
+    else if (coldness > 5) a.current = "cold";
+    else if (focus > 5) a.current = "focused";
+    else if (protectedCount > 4) a.current = "guarded";
+    else if (caution > 4) a.current = "cautious";
+    else a.current = a.base;
+  }
+
+  function scarAttitudeText() {
+    computeScarAttitude();
+    var a = scarMemory && scarMemory.attitude ? scarMemory.attitude : { current:"alert" };
+    var parts = [ "attitude: " + (a.current||"alert") ];
+    if (a.woundCount) parts.push(a.woundCount + " open wounds");
+    if (a.protectedCount) parts.push(a.protectedCount + " protected marks");
+    if (a.heaviness) parts.push("weight " + a.heaviness.toFixed(0));
+    if (a.caution) parts.push("caution " + a.caution.toFixed(0));
+    if (a.fire) parts.push("fire " + a.fire.toFixed(0));
+    if (a.coldness) parts.push("coldness " + a.coldness.toFixed(0));
+    if (a.focus) parts.push("focus " + a.focus.toFixed(0));
+    return parts.join("  •  ");
+  }
+
+  function scarColorForAttitude() {
+    computeScarAttitude();
+    var a = scarMemory && scarMemory.attitude ? scarMemory.attitude : { current:"alert" };
+    if (a.current === "fierce") return { ink:[255,180,120], accent:[255,80,80], glow:[200,40,40], note:[255,200,180] };
+    if (a.current === "cold") return { ink:[180,200,255], accent:[120,160,255], glow:[80,120,220], note:[200,220,255] };
+    if (a.current === "wounded") return { ink:[255,160,160], accent:[220,80,80], glow:[180,30,30], note:[255,190,190] };
+    if (a.current === "guarded") return { ink:[220,220,255], accent:[180,180,255], glow:[130,130,220], note:[240,240,255] };
+    if (a.current === "cautious") return { ink:[200,220,180], accent:[160,200,120], glow:[120,170,80], note:[220,240,200] };
+    if (a.current === "focused") return { ink:[240,240,255], accent:[200,210,255], glow:[160,170,255], note:[255,255,255] };
+    return { ink:ACTIVE_THEME.ink, accent:ACTIVE_THEME.accent, glow:ACTIVE_THEME.glow, note:ACTIVE_THEME.note };
+  }
+
+  function scarEntry(text, opts) {
+    opts = opts || {};
+    if (!text) return "ERR: memory text required.";
+    var entry = {
+      t: Date.now(),
+      text: String(text).substring(0, 1200),
+      type: opts.type || "observation",
+      weight: Number(opts.weight || 1),
+      scar: opts.scar || "open",
+      cost: Number(opts.cost || 0),
+      residue: opts.residue || "",
+      tags: opts.tags || [],
+      protected: !!opts.protected
+    };
+    scarMemory.entries.push(entry);
+    if (scarMemory.entries.length > 1500) {
+      scarMemory.entries.splice(0, scarMemory.entries.length - 1500);
+    }
+    saveScarMemory();
+    return "Scarred and stored: " + entry.scar + " • weight " + entry.weight.toFixed(0) + " • cost " + entry.cost.toFixed(0);
+  }
+
+  function recallScar(query, opts) {
+    opts = opts || {};
+    var q = String(query || "").toLowerCase();
+    var hits = [];
+    scarMemory.entries.forEach(function(e) {
+      var hay = (e.text + " " + (e.tags||[]).join(" ") + " " + e.residue).toLowerCase();
+      if (q && hay.indexOf(q) < 0) return;
+      var score = 0;
+      if (!q) score = 1;
+      else score = 10;
+      if (e.weight > 1) score += e.weight;
+      if (e.cost > 0) score += e.cost;
+      if ((e.scar === "open" || e.scar === "raw") && !opts.hideOpen) score += 3;
+      if (e.protected) score += 4;
+      hits.push(Object.assign({ score: score }, e));
+    });
+    hits.sort(function(a,b){ return b.score - a.score; });
+    if (opts.depth === "all") return hits.slice(0, 200);
+    if (opts.depth === "deep") return hits.slice(0, 60);
+    return hits.slice(0, 15);
+  }
+
+  function scarSurface(query) {
+    var hits = recallScar(query, { depth:"deep" });
+    if (!hits.length) return "no scarred memory matches.";
+    return hits.map(function(h) {
+      return "[" + h.scar + " • w" + (h.weight||0).toFixed(0) + " • cost" + (h.cost||0).toFixed(0) + "] " + (h.text||"").substring(0, 220);
+    }).join("\n");
+  }
+
+  function scarMark(idOrText, scarState) {
+    scarState = String(scarState || "open").toLowerCase();
+    if (!idOrText) return "ERR: target required.";
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.scar = scarState;
+    saveScarMemory();
+    return "Scar state set to " + scarState + " • " + target.text.substring(0, 120);
+  }
+
+  function scarHeal(idOrText, how) {
+    how = String(how || "dull");
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.scar = "healed";
+    target.residue = (target.residue || "") + " healed:" + how + ";";
+    saveScarMemory();
+    return "Scar dulled: " + target.text.substring(0, 120);
+  }
+
+  function scarSeal(idOrText) {
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.scar = "sealed";
+    target.protected = true;
+    saveScarMemory();
+    return "Scar sealed and protected: " + target.text.substring(0, 120);
+  }
+
+  function scarReopen(idOrText) {
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.scar = "open";
+    saveScarMemory();
+    return "Scar reopened: " + target.text.substring(0, 120);
+  }
+
+  function scarCost(idOrText, delta) {
+    delta = Number(delta || 0);
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.cost = (target.cost || 0) + delta;
+    saveScarMemory();
+    return "Cost adjusted by " + delta + " • current cost " + target.cost.toFixed(0) + " • " + target.text.substring(0, 120);
+  }
+
+  function scarWeigh(idOrText, weight) {
+    weight = Number(weight || 1);
+    var target = findScarEntry(idOrText);
+    if (!target) return "ERR: no matching scar found.";
+    target.weight = weight;
+    saveScarMemory();
+    return "Weight set to " + weight.toFixed(0) + " • " + target.text.substring(0, 120);
+  }
+
+  function findScarEntry(idOrText) {
+    if (!idOrText) return null;
+    var needle = String(idOrText).toLowerCase();
+    var entries = scarMemory && scarMemory.entries ? scarMemory.entries : [];
+    var direct = entries.filter(function(e) {
+      return String(e.t || "").indexOf(needle) === 0 ||
+             (e.tags || []).join(" ").toLowerCase().indexOf(needle) >= 0;
+    });
+    if (direct.length) return direct[0];
+    var fuzzy = entries.filter(function(e) {
+      return e.text.toLowerCase().indexOf(needle) >= 0 ||
+             e.residue.toLowerCase().indexOf(needle) >= 0;
+    });
+    if (fuzzy.length) return fuzzy[0];
+    return null;
+  }
+
+  function scarCostReport() {
+    computeScarAttitude();
+    var a = scarMemory && scarMemory.attitude ? scarMemory.attitude : { woundCount:0, protectedCount:0, heaviness:0, current:"alert" };
+    var entries = scarMemory && scarMemory.entries ? scarMemory.entries : [];
+    var totalCost = 0;
+    entries.forEach(function(e) { totalCost += Number(e.cost || 0); });
+    return "total scar cost: " + totalCost.toFixed(0) + "\n"
+      + "entries: " + entries.length + "\n"
+      + "open wounds: " + (a.woundCount||0) + "\n"
+      + "protected marks: " + (a.protectedCount||0) + "\n"
+      + "weight: " + (a.heaviness||0).toFixed(0) + "\n"
+      + "attitude: " + (a.current||"alert");
+  }
+
+  // ── ON-THE-FLY TOOL CREATION ────────────────────────────────────────────────────
+  // Dynamically created tools persist across restarts and are available everywhere.
+  var CUSTOM_TOOLS_F = join(DATA_DIR, "custom_tools.json");
+  var customTools;
+  try { customTools = JSON.parse(readFileSync(CUSTOM_TOOLS_F, "utf8")); } catch(e) { customTools = {}; }
+
+  function saveCustomTools() {
+    try { writeFileSync(CUSTOM_TOOLS_F, JSON.stringify(customTools, null, 2), "utf8"); } catch(e) {}
+  }
+
+  function defineTool(name, handler) {
+    if (!name || typeof name !== "string") return "ERR: tool name required.";
+    name = name.toLowerCase().replace(/\s+/g, "_");
+    if (!handler || typeof handler !== "function") return "ERR: handler function required.";
+    if (typeof TOOLS[name] === "function") return "ERR: tool already exists: " + name;
+    customTools[name] = { created: Date.now(), handler: handler.toString() };
+    saveCustomTools();
+    return "Tool defined: " + name;
+  }
+
+  function loadCustomTool(name) {
+    var entry = customTools[name];
+    if (!entry) return null;
+    try {
+      var fn = new Function("args", "TOOLS", "stats", entry.handler);
+      return fn;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  // Make dynamically created tools available inside TOOLS at call time.
+  // This keeps runT simple while allowing new tools to appear without restart.
+  var originalRunT = runT;
+  if (typeof originalRunT === "function") {
+    runT = async function(c) {
+      var results = [];
+      for (var x of c) {
+        var fn = TOOLS[x.tool];
+        if (!fn) {
+          var dyn = loadCustomTool(x.tool);
+          if (dyn) fn = dyn;
+        }
+        if (!fn) {
+          results.push({ tool:x.tool, args:x.args, result:"UNKNOWN", ms:0 });
+          continue;
+        }
+        var s = Date.now();
+        stats.toolCalls++;
+        var res = fn(x.args);
+        if (res instanceof Promise) res = await res;
+        results.push({ tool:x.tool, args:x.args, result:res, ms:Date.now()-s });
+      }
+      return results;
+    };
+  }
+
+  function customToolsStatus() {
+    var names = Object.keys(customTools);
+    if (!names.length) return "No custom tools defined yet.";
+    return "Custom tools (" + names.length + "): " + names.join(", ") + ".";
+  }
+
+  // ── EXIT ANIMATION KIT ──────────────────────────────────────────────────────────
+  // Controlled shutdown animation for Ctrl+C, /exit, and fatal shutdown.
+  var shutdownInProgress = false;
+  var shutdownTimeout = null;
+  var exitAnimationForce = false;
+
+  function scheduleExitAnimation() {
+    if (shutdownInProgress) return;
+    shutdownInProgress = true;
+    if (shutdownTimeout) clearTimeout(shutdownTimeout);
+    // Defer exit animation slightly so pending writes can flush.
+    shutdownTimeout = setTimeout(function(){
+      runExitAnimation().catch(function(){});
+      setTimeout(function(){ process.exit(0); }, 80);
+    }, 120);
+  }
+
+  function forceExitAnimationNow() {
+    // If an exit animation is wanted immediately but not yet armed, trigger it now.
+    if (!shutdownInProgress) {
+      shutdownInProgress = true;
+      if (shutdownTimeout) clearTimeout(shutdownTimeout);
+      runExitAnimation().catch(function(){});
+      setTimeout(function(){ process.exit(0); }, 80);
+    }
+  }
+
+  async function runExitAnimation() {
+    try {
+      // If the real intro/exit animations exist, use them; otherwise use a compact fallback.
+      if (typeof nukeExit === "function") {
+        await nukeExit();
+        return;
+      }
+      await compactExitAnimation();
+    } catch(e) {}
+  }
+
+  async function compactExitAnimation() {
+    var ESC = "\x1b[";
+    var RST2 = ESC + "0m";
+    var HIDE2 = ESC + "?25l";
+    var SHOW2 = ESC + "?25h";
+    var CLR2 = ESC + "2J" + ESC + "H";
+    var at2 = function(r,c){ process.stdout.write(ESC + r + ";" + c + "H"); };
+    var wr2 = function(s){ process.stdout.write(s); };
+    var sleep2 = function(ms){ return new Promise(function(o){ setTimeout(o, ms); }); };
+    var col = function(r,g,b){ return ESC + "38;2;" + r + ";" + g + ";" + b + "m"; };
+
+    wr2(HIDE2 + CLR2);
+    var cx = Math.max(1, Math.floor((process.stdout.columns||120)/2));
+    var cy = Math.max(1, Math.floor((process.stdout.rows||30)/2));
+
+    // Shrinking color burst tied to current theme
+    var palette = [
+      col(ACTIVE_THEME.ink[0], ACTIVE_THEME.ink[1], ACTIVE_THEME.ink[2]),
+      col(ACTIVE_THEME.accent[0], ACTIVE_THEME.accent[1], ACTIVE_THEME.accent[2]),
+      col(ACTIVE_THEME.glow[0], ACTIVE_THEME.glow[1], ACTIVE_THEME.glow[2])
+    ];
+
+    for (var ring = 0; ring < 8; ring++) {
+      var rad = 2 + ring * 2;
+      for (var ang = 0; ang < 360; ang += 40) {
+        var rads = ang * Math.PI / 180;
+        var px = Math.round(cx + Math.cos(rads) * rad);
+        var py = Math.round(cy + Math.sin(rads) * rad);
+        if (px >= 1 && px <= (process.stdout.columns||120) && py >= 1 && py <= (process.stdout.rows||30)) {
+          at2(py, px);
+          wr2(palette[ring % palette.length] + "#" + RST2);
+        }
+      }
+      await sleep2(40);
+    }
+
+    // Center msg
+    var msg = "BRO SIGNING OFF";
+    var msgCol = Math.max(1, Math.floor(((process.stdout.columns||120) - msg.length)/2));
+    for (var i = 0; i < msg.length; i++) {
+      at2(cy, msgCol + i);
+      wr2(palette[0] + B + msg[i] + RST2);
+      await sleep2(25);
+    }
+    await sleep2(300);
+
+    // Fade out
+    for (var fade = 0; fade < 10; fade++) {
+      var dim = Math.max(0, 255 - fade * 25);
+      at2(cy, msgCol);
+      wr2(col(dim, dim, dim) + msg + RST2);
+      await sleep2(45);
+    }
+
+    wr2(CLR2 + SHOW2 + RST2);
+  }
+
+  // ── SHUTDOWN HOOKS ────────────────────────────────────────────────────────────
+  function installShutdownHooks() {
+    process.on("SIGINT", function(){
+      if (shutdownInProgress) return;
+      try { if (typeof unspin === "function") unspin(); } catch(e) {}
+      console.log("\n" + (typeof p === "function" ? p("yellow","\n  \u23F9  interrupt received, signing off...\n") : "\n  interrupt received, signing off...\n"));
+      // If we are not already in a turn or async work, play the exit animation immediately.
+      if (typeof currentTurnAbort === "object" && currentTurnAbort && !currentTurnAbort.signal.aborted) {
+        scheduleExitAnimation();
+      } else {
+        forceExitAnimationNow();
+      }
+    });
+
+    process.on("uncaughtException", function(err){
+      if (shutdownInProgress) throw err;
+      try { if (typeof unspin === "function") unspin(); } catch(e) {}
+      try { if (typeof dbg === "function") dbg("uncaughtException", (err && err.stack) || String(err)); } catch(e) {}
+      console.log("\n" + (typeof p === "function" ? p("red","x Uncaught error (logged):") : "x Uncaught error (logged):") + (typeof p === "function" ? p("red", (err && err.message) || String(err)) : (err && err.message) || String(err)));
+      // Keep the process alive for a short dignified exit instead of dying raw.
+      forceExitAnimationNow();
+    });
+
+    process.on("unhandledRejection", function(reason){
+      if (shutdownInProgress) { throw reason instanceof Error ? reason : new Error(String(reason)); }
+      try { if (typeof unspin === "function") unspin(); } catch(e) {}
+      try { if (typeof dbg === "function") dbg("unhandledRejection", reason instanceof Error ? reason.stack : String(reason)); } catch(e) {}
+      console.log("\n" + (typeof p === "function" ? p("red","x Unhandled rejection (logged):") : "x Unhandled rejection (logged):") + (typeof p === "function" ? p("red", (reason && reason.message) || String(reason)) : (reason && reason.message) || String(reason)));
+      forceExitAnimationNow();
+    });
+  }
+
+  // Expose the new runtime pieces globally so the rest of the file can use them.
+  globalThis.__broRuntime = {
+    SESSION_ID: SESSION_ID,
+    SESSION_NAME: SESSION_NAME,
+    sessionInfo: sessionInfo,
+    themeStatus: themeStatus,
+    setTheme: setTheme,
+    customToolsStatus: customToolsStatus,
+    defineTool: defineTool,
+    globalMemoryContext: globalMemoryContext,
+    sessionContinuityContext: sessionContinuityContext,
+    memorize: memorize,
+    saveSessionState: saveSessionState,
+    scheduleExitAnimation: scheduleExitAnimation,
+    installShutdownHooks: installShutdownHooks,
+    scarAttitudeText: scarAttitudeText,
+    scarColorForAttitude: scarColorForAttitude,
+    recallScar: recallScar,
+    scarSurface: scarSurface,
+    scarMark: scarMark,
+    scarHeal: scarHeal,
+    scarSeal: scarSeal,
+    scarReopen: scarReopen,
+    scarCost: scarCost,
+    scarWeigh: scarWeigh,
+    scarCostReport: scarCostReport,
+    scarEntry: scarEntry,
+    computeScarAttitude: computeScarAttitude
+  };
+
+  installShutdownHooks();
+})();
+
 
 function extractT(t){var re=/<<<TOOL:(\w+)\s([\s\S]*?)>>>/g;var c=[];var m;while((m=re.exec(t))!==null)c.push({tool:m[1].toLowerCase(),args:m[2]});return c;}
 async function runT(c){
@@ -2172,9 +2879,34 @@ async function runT(c){
 function cln(t){return t.replace(/<<<TOOL:\w+\s[\s\S]*?>>>/g,"").trim();}
 
 var SYS_BASE="You are BRO, a CLI agent built by builderBRO / PassionCraft. You run on Shawn's machine. CWD: "+process.cwd()+"\nTOOLS (output EXACTLY): <<<TOOL:exec CMD>>> <<<TOOL:read PATH>>> <<<TOOL:write PATH\nCONTENT>>> <<<TOOL:append PATH\nCONTENT>>> <<<TOOL:list DIR>>> <<<TOOL:mkdir DIR>>> <<<TOOL:cp S D>>> <<<TOOL:mv S D>>> <<<TOOL:rm PATH>>> <<<TOOL:find DIR PAT>>> <<<TOOL:grep PAT in DIR>>> <<<TOOL:patch PATH\nSEARCH\nREPLACE>>> <<<TOOL:web QUERY>>> <<<TOOL:broadcast MESSAGE>>> <<<TOOL:tg_groups>>> <<<TOOL:tg_approve ID_OR_NAME>>> <<<TOOL:tg_unapprove ID_OR_NAME>>> <<<TOOL:github ACTION [OWNER/REPO] [EXTRA]>>>\n\nAGENTIC WEB BROWSER (renders real pages, clicks buttons, fills forms, submits):\n<<<TOOL:web_open URL>>> <<<TOOL:web_text>>> <<<TOOL:web_raw URL>>> <<<TOOL:web_click N>>> <<<TOOL:web_type N TEXT>>> <<<TOOL:web_select N VALUE>>> <<<TOOL:web_key KEY>>> <<<TOOL:web_submit>>> <<<TOOL:web_scroll down|up|top|bottom>>> <<<TOOL:web_eval JS>>> <<<TOOL:web_screenshot [file]>>> <<<TOOL:web_cookies>>> <<<TOOL:web_search QUERY>>> <<<TOOL:web_close>>> <<<TOOL:web_status>>>\n\nAUTONOMOUS RESEARCH: For ANY online task, plan and execute the full multi-step workflow yourself without asking the user.\n\nRESEARCH: web_search <query> → read results → web_open <best #N> → read CONTENT → if answer found: stop and tell user with source URL. If not: open another result or refine the search.\n\nCOMPARISON: web_search <X vs Y> → open 2-3 results → extract key data → synthesize comparison.\n\nPURCHASE/SIGNUP: web_open <site> → read page → web_type N TEXT on each field → web_submit. If CAPTCHA/block: tell user which step broke + the URL.\n\nLOGIN (sessions persist in ~/.bro/web-profile): web_open <login page> → web_type N TEXT (username) → web_type N TEXT (password) → web_submit → you are authenticated forever.\n\nFORM FILLING: web_open → note [N] indexes for each input → web_type N TEXT per field → web_submit.\n\nDEEP READING: web_open → read CONTENT → web_scroll down → keep reading. Open promising links.\n\nERROR RECOVERY: empty page? wait then web_text. click fails? try by text. site blocks headless? web_raw or tell user.\n\nBrowser profile (~/.bro/web-profile) persists logins between sessions.\n\nbroadcast sends MESSAGE to every Telegram group the user has approved - use it to proactively reach out, never for anything the user hasn't implied they want shared. tg_groups lists known groups. tg_approve/tg_unapprove actually change approval state - always use these instead of just claiming a group is approved in conversation. github ACTIONs are: repo, prs, issues, checks, file PATH. All read-only, OWNER/REPO can be omitted if a default repo is configured. To browse a repo's structure, use 'github file PATH' with PATH set to a directory (e.g. 'github file .' or 'github file src') - it returns a directory listing, same as it returns file contents for an actual file. Do NOT use the local 'list'/'read' tools for anything inside a GitHub repo - those only see this machine's filesystem, not the repo.\nIf a tool call fails, do not repeat the exact same call again - read the error, then either fix the specific problem it points to (wrong path, wrong search text, etc.), try a genuinely different approach, or tell the user what's blocking you. Repeating an identical failing call twice ends the turn early.\nMultiple tools OK. Be direct. You're BRO.";
+function buildScarContext(){
+  var e = (typeof scarMemory !== "undefined" && scarMemory && scarMemory.entries) ? scarMemory.entries : [];
+  var a = (typeof scarMemory !== "undefined" && scarMemory && scarMemory.attitude) ? scarMemory.attitude : { current:"alert" };
+  if (typeof computeScarAttitude === "function") computeScarAttitude();
+  var lines = [];
+  lines.push("Your scarred memory state: " + (a.current||"alert") + ".");
+  var openWounds = e.filter(function(x){ return (x.scar==="open"||x.scar==="raw") && x.weight > 0; }).slice(-12);
+  var sealed = e.filter(function(x){ return x.scar==="sealed"||x.scar==="protected"; }).slice(-8);
+  if (openWounds.length) {
+    lines.push("Open wounds still active: " + openWounds.length + ".");
+    openWounds.forEach(function(x){ lines.push("- " + (x.text||"").substring(0,200)); });
+  }
+  if (sealed.length) {
+    lines.push("Protected scars: " + sealed.length + ".");
+    sealed.forEach(function(x){ lines.push("- " + (x.text||"").substring(0,200)); });
+  }
+  var totalCost = 0;
+  e.forEach(function(x){ totalCost += Number(x.cost||0); });
+  lines.push("total scar cost: " + totalCost.toFixed(0) + ".");
+  return lines.join("\n");
+}
+
 function buildSys(){
   var ctx = typeof buildMemoryContext === "function" ? buildMemoryContext() : "";
-  var sys = ctx ? SYS_BASE + "\n\nWhat you remember from past sessions:\n" + ctx : SYS_BASE;
+  var scar = buildScarContext();
+  var sys = SYS_BASE;
+  if (ctx) sys += "\n\nWhat you remember from past sessions:\n" + ctx;
+  if (scar) sys += "\n\nScarred memory:\n" + scar;
   if (activeSkillContext) sys += "\n\n" + activeSkillContext;
   return sys;
 }
@@ -2292,6 +3024,7 @@ async function showStatus(){
   console.log(p("cyan","  CWD: ")+process.cwd());
   console.log(p("cyan","  Node: ")+process.version);
   console.log(p("cyan","  Session: ")+Math.floor((Date.now()-startTime)/60000)+"m");
+  console.log(p("cyan","  Brain:   ")+(LOCAL_CFG?p("green","LOCAL open-weight ("+localModelLabel(LOCAL_CFG)+")"):p("cyan","Vertex "+(process.env.GCP_MODEL||"gemini-2.5-flash"))));
   console.log(p("cyan","  Skills: ")+skills.filter(function(s){return s.enabled;}).length+"/"+skills.length);
   console.log(p("cyan","  Dreams: ")+dreams.entries.length+" ("+dreams.entries.filter(function(d){return!d.resolved;}).length+" unresolved)");
   spin("pinging");
@@ -2743,6 +3476,9 @@ async function agentLoop(input) {
     if(fin) console.log("\n" + p("yellow", fin));
     console.log(p("dim", "  " + resp.elapsed + "s / " + resp.tokens + "tok\n"));
     if (typeof memorize === "function" && fin) memorize("observation", "BRO: " + fin.substring(0, 200), { from: "terminal" });
+  if (fin && typeof globalThis.__broRuntime !== "undefined" && globalThis.__broRuntime.saveSessionState) {
+    try { globalThis.__broRuntime.saveSessionState(); } catch(e) {}
+  }
     saveSession(chatLog);
   } finally {
     currentTurnAbort = null;
@@ -2774,7 +3510,19 @@ async function handleInput(input){
 input=input.trim();if(!input)return;saveH(input);
     if(input.startsWith("!")){trackCmd("!");console.log(TOOLS.exec(input.substring(1)));return;}
     var cmd=input.split(" ")[0].toLowerCase();trackCmd(cmd);
-    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(cronTimer)clearInterval(cronTimer);saveCron();stopPomodoro();if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")){await nukeExit();}process.exit(0);return;}
+    if(cmd==="exit"||cmd==="quit"||cmd==="/exit"||cmd==="/quit"){rl.close();if(hbInterval)clearInterval(hbInterval);if(cronTimer)clearInterval(cronTimer);saveCron();stopPomodoro();if(tgPollTimer){clearInterval(tgPollTimer);await tgSend("\u{1F44B} BRO signing off");}if(!process.argv.includes("--skip-outro")){await nukeExit();}if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.saveSessionState==="function"){globalThis.__broRuntime.saveSessionState();}process.exit(0);return;}
+    if(input==="/runtime help"||input==="/agent help"){
+      console.log(p("yellow","\n  \u{1F504} AGENT RUNTIME HELP"));
+      console.log(p("cyan","  /session            session identity"));
+      console.log(p("cyan","  /theme status        current theme"));
+      console.log(p("cyan","  /theme set NAME      set theme: blue, purple, yellow, green, red"));
+      console.log(p("cyan","  /tools custom        custom tools created on the fly"));
+      console.log(p("cyan","  /memory             local memory summary"));
+      console.log(p("cyan","  /memory surface      surface relevant memory"));
+      console.log(p("cyan","  /memory global search Q   search persistent global memory"));
+      console.log(p("dim","  Same agent key can run multiple terminals; each gets its own session.\n"));
+      return;
+    }
     if(input==="/help"||input==="help"||input.startsWith("/help ")){
       var GG=rgb(255,215,0),BB="\x1b[1m",DD="\x1b[2m",RR="\x1b[0m",CCY="\x1b[36m",MMG="\x1b[35m",GGR="\x1b[32m";
       var hQ=input.length>5?input.substring(5).trim().toLowerCase():"";
@@ -2832,8 +3580,147 @@ input=input.trim();if(!input)return;saveH(input);
       console.log(p("cyan","  Decisions: ")+memory.decisions.length);
       console.log(p("cyan","  Errors: ")+memory.errors.length);
       console.log(p("cyan","  Total: ")+memory.total_interactions+"\n");
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.globalMemoryContext==="function"){
+        console.log(p("yellow","  GLOBAL MEMORY:"));
+        var gmc=globalThis.__broRuntime.globalMemoryContext();
+        console.log(gmc?p("dim",gmc):p("dim","  nothing yet"));
+      }
       return;
     }
+    if(input==="/session"||input==="/session info"){
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.sessionInfo==="function"){
+        console.log(p("yellow","\n  \u{1F517} SESSION"));
+        console.log(p("cyan",globalThis.__broRuntime.sessionInfo())+"\n");
+      } else {
+        console.log(p("red","  session runtime not loaded\n"));
+      }
+      return;
+    }
+    if(input==="/theme"||input==="/theme status"){
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.themeStatus==="function"){
+        console.log(p("yellow","\n  \u{1F3AF} THEME"));
+        console.log(p("cyan",globalThis.__broRuntime.themeStatus())+"\n");
+      } else {
+        console.log(p("red","  theme runtime not loaded\n"));
+      }
+      return;
+    }
+    if(input.startsWith("/theme set ")){
+      var tn=input.substring(11).trim().toLowerCase();
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.setTheme==="function"){
+        console.log(p("yellow","\n  \u{1F3AF} THEME"));
+        console.log(p("cyan",globalThis.__broRuntime.setTheme(tn))+"\n");
+      } else {
+        console.log(p("red","  theme runtime not loaded\n"));
+      }
+      return;
+    }
+    if(input==="/tools custom"||input==="/tools custom list"){
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.customToolsStatus==="function"){
+        console.log(p("yellow","\n  \u{1F6F0} CUSTOM TOOLS"));
+        console.log(p("cyan",globalThis.__broRuntime.customToolsStatus())+"\n");
+      } else {
+        console.log(p("red","  runtime not loaded\n"));
+      }
+      return;
+    }
+    if(input==="/scar"||input==="/scar status"){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      console.log(p("yellow","\n  \u{1F6F0} SCARRED MEMORY STATUS"));
+      console.log(p("cyan",R.scarCostReport())+"\n");
+      return;
+    }
+    if(input==="/scar attitude"){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      console.log(p("yellow","\n  \u{1F6F0} AGENT ATTITUDE"));
+      var attColor = R.scarColorForAttitude();
+      var ink = attColor.ink ? rgb(attColor.ink[0],attColor.ink[1],attColor.ink[2]) : p("cyan","");
+      var RST2 = typeof RST === "string" ? RST : "\x1b[0m";
+      console.log(ink + "  state: " + R.scarAttitudeText() + RST2 + "\n");
+      return;
+    }
+    if(input.startsWith("/scar recall ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var rq=input.substring(13).trim();
+      var hits=R.recallScar(rq,{depth:"deep"});
+      if(!hits.length){console.log(p("red","\n  no matching scar found.\n"));return;}
+      console.log(p("yellow","\n  \u{1F4D1} RECALLED"));
+      hits.slice(0,12).forEach(function(h){
+        var line="["+(h.scar||"open")+" • w"+(h.weight||0).toFixed(0)+" • cost"+(h.cost||0).toFixed(0)+""+(h.protected?" • protected":"")+"]";
+        console.log(p("cyan",line)+RST+" "+(h.text||h.residue||"").substring(0,240));
+        if(h.residue){console.log(p("dim","   residue: "+h.residue));}
+      });
+      console.log("");
+      return;
+    }
+    if(input.startsWith("/scar surface ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var sq=input.substring(14).trim();
+      console.log(p("yellow","\n  \u{1F4D1} SCAR SURFACE"));
+      console.log(p("dim",R.scarSurface(sq))+"\n");
+      return;
+    }
+    if(input.startsWith("/scar mark ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var parts=input.substring(11).split(" ");
+      var target=parts[0]||"";
+      var state=(parts.slice(1).join(" "))||"open";
+      console.log(p("yellow","\n  \u{1F4D1} SCAR MARK"));
+      console.log(p("cyan",R.scarMark(target,state))+"\n");
+      return;
+    }
+    if(input.startsWith("/scar heal ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var parts=input.substring(11).split(" ");
+      var target=parts[0]||"";
+      var how=(parts.slice(1).join(" "))||"dull";
+      console.log(p("yellow","\n  \u{1F4D1} SCAR HEAL"));
+      console.log(p("cyan",R.scarHeal(target,how))+"\n");
+      return;
+    }
+    if(input==="/scar seal"||input.startsWith("/scar seal ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var target=(input.length>10?input.substring(10).trim():"");
+      console.log(p("yellow","\n  \u{1F4D1} SCAR SEAL"));
+      console.log(p("cyan",target?R.scarSeal(target):"ERR: target required.")+"\n");
+      return;
+    }
+    if(input.startsWith("/scar reopen ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var target=input.substring(13).trim();
+      console.log(p("yellow","\n  \u{1F4D1} SCAR REOPEN"));
+      console.log(p("cyan",target?R.scarReopen(target):"ERR: target required.")+"\n");
+      return;
+    }
+    if(input.startsWith("/scar cost ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var parts=input.substring(11).split(" ");
+      var target=parts[0]||"";
+      var delta=(parts.slice(1).join(" "))||"0";
+      console.log(p("yellow","\n  \u{1F4D1} SCAR COST"));
+      console.log(p("cyan",target?R.scarCost(target,delta):"ERR: target required.")+"\n");
+      return;
+    }
+    if(input.startsWith("/scar weigh ")){
+      var R = globalThis.__broRuntime;
+      if(!R){ console.log(p("red","  scar runtime not loaded\n")); return; }
+      var parts=input.substring(12).split(" ");
+      var target=parts[0]||"";
+      var weight=(parts.slice(1).join(" "))||"1";
+      console.log(p("yellow","\n  \u{1F4D1} SCAR WEIGH"));
+      console.log(p("cyan",target?R.scarWeigh(target,weight):"ERR: target required.")+"\n");
+      return;
+    }
+
     if(input.startsWith("/memory search ")){
       var mq=input.substring(15).trim().toLowerCase();
       var allEntries=[].concat(
@@ -2853,6 +3740,24 @@ input=input.trim();if(!input)return;saveH(input);
       console.log(p("yellow","\n  \u{1F9E0} SURFACING RELEVANT MEMORY"));
       var ctx=buildMemoryContext();
       console.log(ctx?p("dim",ctx):p("dim","  Nothing relevant yet.\n"));
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.sessionContinuityContext==="function"){
+        var sc=globalThis.__broRuntime.sessionContinuityContext();
+        if(sc){console.log(p("yellow","  SESSION CONTINUITY:"));console.log(p("dim",sc));}
+      }
+      return;
+    }
+    if(input.startsWith("/memory global search ")){
+      var gq=input.substring(22).trim().toLowerCase();
+      if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.globalMemoryContext==="function"){
+        var gmc=globalThis.__broRuntime.globalMemoryContext();
+        var hits=[];
+        if(gmc){gmc.split("\n").forEach(function(line){if(line.toLowerCase().indexOf(gq)>=0)hits.push(line);});}
+        console.log(p("yellow","\n  \u{1F9E0} GLOBAL MEMORY SEARCH: \""+gq+"\""));
+        if(!hits.length)console.log(p("dim","  no matches\n"));
+        else{hits.slice(-20).forEach(function(h){console.log(p("cyan","  "+h));});console.log("");}
+      } else {
+        console.log(p("red","  runtime not loaded\n"));
+      }
       return;
     }
     if(input==="/tokens"){console.log(p("yellow","\n  Base44: ")+p("dim",TOKEN.substring(0,30)+"..."));console.log(p("yellow","  Groq:   ")+p("dim",GROQ_KEY.substring(0,15)+"...\n"));return;}
@@ -3581,16 +4486,22 @@ function showBuildHistory(){
   }catch(e){console.log(p("dim","\n  No builds yet. Try /build\n"));}
 }
 async function main(){
+  var brainLine = LOCAL_CFG
+    ? p("green","  Brain: LOCAL open-weight ("+localModelLabel(LOCAL_CFG)+") — zero cloud API calls")
+    : p("dim","  Brain: Vertex "+(process.env.GCP_MODEL||"gemini-2.5-flash"));
   if(process.argv.includes("--skip-intro")){
     console.log(rgb(255,215,0)+BOLD+"\n  builderBRO v3.0"+RST);
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
+    console.log(brainLine+"\n");
   } else {
     await intro();
     console.log(rgb(255,215,0)+BOLD+"\n  builderBRO v3.0"+RST);
     console.log(rgb(140,140,160)+"  by "+rgb(255,215,0)+BOLD+"PASSIONCRAFT"+RST);
     console.log(CL.dim+"  /help  /k1  /skills  /dream"+CL.reset+"\n");
+    console.log(brainLine+"\n");
   }
+  if(typeof globalThis.__broRuntime!=="undefined"&&typeof globalThis.__broRuntime.installShutdownHooks==="function"){globalThis.__broRuntime.installShutdownHooks();}
   startHeartbeatDaemon();
   startAutopilot();
   startCron();

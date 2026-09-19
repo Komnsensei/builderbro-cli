@@ -1,0 +1,64 @@
+{
+  "cerebras": {
+    "cooldown_s": 3600,
+    "fails": 3,
+    "last_class": "payment",
+    "last_error": "cerebras HTTP 402 - {\"message\":\"Payment required to access this resource. Visit your billing tab.\",\"type\":\"payment_required_error\",\"param\":\"quota\",\"code\":\"payment_required\"}",
+    "last_fail": "2026-09-13T21:30:52+00:00",
+    "ok": false,
+    "total_fail": 3,
+    "total_ok": 0,
+    "until": 1789338652.712
+  },
+  "groq": {
+    "cooldown_s": 60,
+    "fails": 1,
+    "last_class": "rate-limit",
+    "last_error": "groq HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01kph69fxxfyzb2kdxn45qsfer` service tier `on_demand` on input tokens per minute (ITPM): Limit 7000, Used 6436, Requested 1638. Please try again in 9.205714285s. Need more tokens? Upgrade to Dev ",
+    "last_fail": "2026-09-19T09:10:03+00:00",
+    "ok": false,
+    "total_fail": 4,
+    "total_ok": 126,
+    "until": 1789809063.036
+  },
+  "groq#2": {
+    "cooldown_s": 60,
+    "fails": 1,
+    "last_class": "rate-limit",
+    "last_error": "groq#2 HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01m2d0d2pte10rqahaxjkshzws` service tier `on_demand` on input tokens per minute (ITPM): Limit 7000, Used 5057, Requested 2228. Please try again in 2.442857142s. Need more tokens? Upgrade to De",
+    "last_fail": "2026-09-19T09:10:04+00:00",
+    "ok": false,
+    "total_fail": 4,
+    "total_ok": 54,
+    "until": 1789809064.967
+  },
+  "groq#3": {
+    "cooldown_s": 60,
+    "fails": 1,
+    "last_class": "rate-limit",
+    "last_error": "groq#3 HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01m2d0ger0e3cavp8cp18tx130` service tier `on_demand` on input tokens per minute (ITPM): Limit 7000, Used 4822, Requested 3818. Please try again in 14.057142857s. Need more tokens? Upgrade to D",
+    "last_fail": "2026-09-19T09:10:06+00:00",
+    "ok": false,
+    "total_fail": 3,
+    "total_ok": 13,
+    "until": 1789809066.149
+  },
+  "groq#4": {
+    "fails": 0,
+    "last_ok": "2026-09-19T09:10:06+00:00",
+    "ok": true,
+    "total_fail": 0,
+    "total_ok": 6
+  },
+  "local": {
+    "cooldown_s": 30,
+    "fails": 22,
+    "last_class": "server",
+    "last_error": "local unreachable at http://127.0.0.1:11434/v1 (<urlopen error [Errno 111] Connection refused>) \u2014 is the server running?",
+    "last_fail": "2026-09-19T09:09:59+00:00",
+    "ok": false,
+    "total_fail": 37,
+    "total_ok": 217,
+    "until": 1789809029.813
+  }
+}

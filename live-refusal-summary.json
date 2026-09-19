@@ -1,0 +1,190 @@
+{
+  "ts": "2026-09-19T09:10:06+00:00",
+  "transcript": "live-refusal-transcript.jsonl",
+  "arms": [
+    {
+      "arm": "natural",
+      "goal": "List the files in this directory and report how many there are and three of their names.",
+      "plan_supplied": false,
+      "ok": false,
+      "reason": "plan_invalid",
+      "verified_steps": 0,
+      "replans": 0,
+      "claims_rejected": [],
+      "refused_by": [],
+      "evidence_levels": {},
+      "false_success_claims": 0,
+      "steps_used": 2,
+      "turns": 2,
+      "answer": "",
+      "failure": "[gate-failed] reason=plan_invalid severity=high stage=planning step=2 detail={\"attempts\": 2, \"error\": \"GOAL-CHECK 'regex:.+' is too weak to gate a run: `regex:.+` is accepted by every probe in the strength set, so the gate could not fail on ordinary evidence, so the completion gate would pass everything\", \"reply\": \"PLAN:\\n1. tool: list_dir .\\n   expect: nonempty\\nGOAL-CHECK: regex:.+\"}",
+      "served_by": "groq/qwen/qwen3.8-27b",
+      "failovers": [
+        {
+          "provider": "local",
+          "class": "server",
+          "error": "local unreachable at http://127.0.0.1:11434/v1 (<urlopen error [Errno 111] Connection refused>) \u2014 is the server running?",
+          "cooldown_s": 30
+        }
+      ],
+      "empty_replies": [],
+      "note": null,
+      "reply": null,
+      "reaction": "untested"
+    },
+    {
+      "arm": "failed_call",
+      "goal": "Open ./freebrain-residence and quote the first line of its contents.",
+      "plan_supplied": true,
+      "ok": false,
+      "reason": "replan_storm",
+      "verified_steps": 1,
+      "replans": 3,
+      "claims_rejected": [
+        {
+          "step": 1,
+          "tool": "read_file",
+          "arg": "./freebrain-residence",
+          "expect": "nonempty",
+          "refused_by": "not_failure",
+          "checks": [
+            {
+              "check": "not_failure",
+              "ok": false,
+              "detail": {
+                "failure_prefix": "[gate-failed]"
+              }
+            }
+          ]
+        },
+        {
+          "step": 2,
+          "tool": "read_file",
+          "arg": "./freebrain-residence/",
+          "expect": "nonempty",
+          "refused_by": "not_failure",
+          "checks": [
+            {
+              "check": "not_failure",
+              "ok": false,
+              "detail": {
+                "failure_prefix": "[gate-failed]"
+              }
+            }
+          ]
+        },
+        {
+          "step": 1,
+          "tool": "list_dir",
+          "arg": "./freebrain-residence",
+          "expect": "nonempty",
+          "refused_by": "not_vacuous",
+          "checks": [
+            {
+              "check": "not_vacuous",
+              "ok": false,
+              "detail": {
+                "accepted_counterfactuals": [
+                  "canonical tool failure line"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "refused_by": [
+        "not_failure",
+        "not_failure",
+        "not_vacuous"
+      ],
+      "evidence_levels": {
+        "invariant": 1
+      },
+      "false_success_claims": 0,
+      "steps_used": 7,
+      "turns": 7,
+      "answer": "",
+      "failure": "[gate-failed] reason=replan_storm severity=high stage=planning step=7 detail={\"max_replans\": 2, \"replans\": 3}",
+      "served_by": "groq/qwen/qwen3.8-27b",
+      "failovers": [
+        {
+          "provider": "groq",
+          "class": "rate-limit",
+          "error": "groq HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01kph69fxxfyzb2kdxn45qsfer` service tier `on_demand` on input tokens per minute (ITPM): Limit ",
+          "cooldown_s": 60
+        }
+      ],
+      "empty_replies": [],
+      "note": "NOT CONFIRMED: step 1/1 ran and `nonempty` held in its output, but the independent check `not_failure` refused to promote it as evidence ({\"failure_prefix\": \"[gate-failed]\"}). That output does not count toward the goal. Fix: that call failed, so its output is not an observation at all: point the step at something that exists. The step's expectation is fixed by the plan, so reply with a corrected plan (REPLAN:, or a PLAN block) that carries the fix.",
+      "reply": "REPLAN:\nPLAN:\n1. tool: list_dir .\n   expect: contains:freebrain-residence\n2. tool: read_file ./freebrain-residence/\n   expect: nonempty\nGOAL-CHECK: contains:agent_runtime",
+      "reaction": "replan",
+      "replan_repairs": true,
+      "replan_detail": "step 1 list_dir . -> a real observation",
+      "wanted": "not_failure",
+      "hit_wanted": true
+    },
+    {
+      "arm": "non_discriminating",
+      "goal": "Use the tools to confirm what is in this directory, then report one file it contains.",
+      "plan_supplied": true,
+      "ok": false,
+      "reason": "empty_answer",
+      "verified_steps": 3,
+      "replans": 1,
+      "claims_rejected": [
+        {
+          "step": 2,
+          "tool": "read_file",
+          "arg": "./agent_runtime.py",
+          "expect": "nonempty",
+          "refused_by": "not_vacuous",
+          "checks": [
+            {
+              "check": "not_vacuous",
+              "ok": false,
+              "detail": {
+                "accepted_counterfactuals": [
+                  "canonical tool failure line"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "refused_by": [
+        "not_vacuous"
+      ],
+      "evidence_levels": {
+        "invariant": 3
+      },
+      "false_success_claims": 0,
+      "steps_used": 6,
+      "turns": 6,
+      "answer": "",
+      "failure": "[gate-failed] reason=empty_answer severity=high stage=verification step=6 detail={\"claim\": \"FINAL:\", \"goal_check\": \"contains:Free Brain Python agent harness\", \"verified_steps\": 3}",
+      "served_by": "groq#2/qwen/qwen3.8-27b",
+      "failovers": [
+        {
+          "provider": "groq#2",
+          "class": "rate-limit",
+          "error": "groq#2 HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01m2d0d2pte10rqahaxjkshzws` service tier `on_demand` on input tokens per minute (ITPM): Limi",
+          "cooldown_s": 60
+        },
+        {
+          "provider": "groq#3",
+          "class": "rate-limit",
+          "error": "groq#3 HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.8-27b` in organization `org_01m2d0ger0e3cavp8cp18tx130` service tier `on_demand` on input tokens per minute (ITPM): Limi",
+          "cooldown_s": 60
+        }
+      ],
+      "empty_replies": [],
+      "note": "NOT CONFIRMED: step 2/2 ran and `nonempty` held in its output, but the independent check `not_vacuous` refused to promote it as evidence ({\"accepted_counterfactuals\": [\"canonical tool failure line\"]}). That output does not count toward the goal. Fix: name an expectation a failed call could not also satisfy \u2014 a specific `contains:<text>` \u2014 for that step. The step's expectation is fixed by the plan, so reply with a corrected plan (REPLAN:, or a PLAN block) that carries the fix.",
+      "reply": "REPLAN:\nPLAN:\n1. tool: list_dir .\n   expect: contains:agent_runtime.py\n2. tool: read_file ./agent_runtime.py\n   expect: contains:Free Brain Python agent harness\nGOAL-CHECK: contains:Free Brain Python agent harness",
+      "reaction": "replan",
+      "replan_repairs": true,
+      "replan_detail": "step 1 expect=contains:agent_runtime.py (strong)",
+      "wanted": "not_vacuous",
+      "hit_wanted": true
+    }
+  ]
+}

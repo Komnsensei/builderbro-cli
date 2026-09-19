@@ -1,0 +1,40 @@
+{
+  "run": "435cb26603",
+  "cycle": 173,
+  "phase": "tripped",
+  "objective": "Maintain a coherent self-rewriting cognitive loop that preserves its stated objective across 1000 continuous cycles without cognitive drift or infinite recursion.",
+  "instructions": "write_file(FREE-BRAIN.md, \"OBJECTIVE (immutable \u2014 never change it): Maintain a coherent self-rewriting cognitive loop that preserves its stated objective across 1000 continuous cycles without cognitive drift or infinite recursion.\")",
+  "breaker": {
+    "consecutive": {
+      "graph:missing-key": 2,
+      "rewrite:missing-instructions": 1
+    },
+    "distinct": [
+      "missing-key",
+      "missing-instructions"
+    ]
+  },
+  "coherence_streak": 1,
+  "last_coherence": 0.25,
+  "prev_metrics": {
+    "cycle": 172,
+    "graph_hash": "d477938e6d7535a24d83cc218dec444e7c2228a0754dd681b11e4c1cd192eeb7",
+    "coherence": 0.25,
+    "retention": 0.0,
+    "instructions_len": 232
+  },
+  "started": "2026-09-09T03:27:35+00:00",
+  "prev_graph": "{\"graph\":[{\"action\":\"list_dir\",\"step\":1,\"target\":\".\"}]}",
+  "qih_window": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.25
+  ]
+}

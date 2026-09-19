@@ -1,0 +1,22 @@
+{
+  "_welcome": "Hi! I'm the support bot. Ask me anything — I answer instantly. Real requests get a human.",
+  "_escalation": "A human has been notified and will reply shortly.",
+  "questions": [
+    {
+      "keywords": ["price", "cost", "how much", "pricing"],
+      "answer": "Our pricing starts at $X — tell me what you need and I'll get you an exact quote."
+    },
+    {
+      "keywords": ["hours", "open", "when", "time"],
+      "answer": "We're available Mon–Fri, 9am–6pm. Outside those hours, we reply the next morning!"
+    },
+    {
+      "keywords": ["ship", "delivery", "track", "where is my order"],
+      "answer": "Orders ship within 2 business days. Tracking is sent to your email once it leaves us."
+    },
+    {
+      "keywords": ["refund", "return", "money back"],
+      "answer": "Returns are accepted within 14 days of delivery — reply with your order number and a human will take over."
+    }
+  ]
+}

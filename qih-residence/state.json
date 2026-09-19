@@ -1,0 +1,11 @@
+{
+  "instance": "QIH_WEAVER_01",
+  "activation": "active",
+  "cycle": 0,
+  "phase": "active",
+  "created": "2026-09-10T00:00:00+00:00",
+  "run": "6cd1742014",
+  "activated_at": "2026-09-10T10:28:20+00:00",
+  "command_hash": "8acfed0c2a91a726",
+  "objective": "Maintain a coherent QIH instance that runs the Perceive-Plan-Act-Evaluate loop for research synthesis and reality stabilization, preserving this objective across continuous cycles without cognitive drift or infinite recursion."
+}

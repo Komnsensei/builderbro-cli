@@ -1,0 +1,252 @@
+{
+  "members": [
+    {
+      "id": "you",
+      "name": "You",
+      "history": [
+        {
+          "at": "2026-09-03T00:58:17.097Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T14:20:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T15:05:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T15:40:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T18:30:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T19:10:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T23:45:00.000Z",
+          "activity": "still"
+        },
+        {
+          "at": "2026-09-02T04:00:00.000Z",
+          "activity": "sleeping"
+        }
+      ],
+      "status": {
+        "activity": "sleeping",
+        "location": "home",
+        "headphones": false,
+        "battery": 88,
+        "charging": true,
+        "at": "2026-09-02T04:00:00.000Z"
+      }
+    },
+    {
+      "id": "mara",
+      "name": "Mara",
+      "history": [
+        {
+          "at": "2026-09-02T13:50:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T14:30:00.000Z",
+          "activity": "transit"
+        },
+        {
+          "at": "2026-09-02T15:15:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T18:45:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T20:00:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-03T00:30:00.000Z",
+          "activity": "still"
+        },
+        {
+          "at": "2026-09-02T03:40:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T05:10:00.000Z",
+          "activity": "sleeping"
+        }
+      ],
+      "status": {
+        "activity": "sleeping",
+        "location": "home",
+        "headphones": false,
+        "battery": 71,
+        "charging": true,
+        "at": "2026-09-02T05:10:00.000Z"
+      }
+    },
+    {
+      "id": "dax",
+      "name": "Dax",
+      "history": [
+        {
+          "at": "2026-09-02T12:40:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T14:00:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T17:30:00.000Z",
+          "activity": "still"
+        },
+        {
+          "at": "2026-09-02T19:00:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T21:20:00.000Z",
+          "activity": "transit"
+        },
+        {
+          "at": "2026-09-02T01:10:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T05:30:00.000Z",
+          "activity": "sleeping"
+        }
+      ],
+      "status": {
+        "activity": "sleeping",
+        "location": "home",
+        "headphones": false,
+        "battery": 63,
+        "charging": true,
+        "at": "2026-09-02T05:30:00.000Z"
+      }
+    },
+    {
+      "id": "luz",
+      "name": "Luz",
+      "history": [
+        {
+          "at": "2026-09-02T14:00:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T15:20:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T18:00:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T21:30:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T22:15:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-03T01:00:00.000Z",
+          "activity": "still"
+        },
+        {
+          "at": "2026-09-02T04:40:00.000Z",
+          "activity": "sleeping"
+        }
+      ],
+      "status": {
+        "activity": "sleeping",
+        "location": "home",
+        "headphones": false,
+        "battery": 74,
+        "charging": true,
+        "at": "2026-09-02T04:40:00.000Z"
+      }
+    },
+    {
+      "id": "sam",
+      "name": "Sam",
+      "history": [
+        {
+          "at": "2026-09-02T15:10:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T16:00:00.000Z",
+          "activity": "still"
+        },
+        {
+          "at": "2026-09-02T19:20:00.000Z",
+          "activity": "transit"
+        },
+        {
+          "at": "2026-09-02T20:05:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-03T00:50:00.000Z",
+          "activity": "walking"
+        },
+        {
+          "at": "2026-09-02T02:00:00.000Z",
+          "activity": "active"
+        },
+        {
+          "at": "2026-09-02T05:50:00.000Z",
+          "activity": "sleeping"
+        }
+      ],
+      "status": {
+        "activity": "sleeping",
+        "location": "home",
+        "headphones": false,
+        "battery": 66,
+        "charging": true,
+        "at": "2026-09-02T05:50:00.000Z"
+      }
+    }
+  ],
+  "questions": [
+    {
+      "id": "da823523-daad-4238-bb3b-b15eb8757ac4",
+      "title": "test question",
+      "choices": [
+        "agree",
+        "disagree",
+        "abstain"
+      ],
+      "votes": {
+        "you": {
+          "choice": "agree",
+          "stance": null,
+          "at": 1788397097240
+        }
+      },
+      "log": [
+        {
+          "memberId": "you",
+          "choice": "agree",
+          "stance": null,
+          "at": 1788397097240,
+          "change": true
+        }
+      ],
+      "proposer": "you",
+      "at": 1788397097200,
+      "closed": false
+    }
+  ]
+}

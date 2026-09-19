@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ship it. — Automation & AI agents, done for you</title>
+<meta name="description" content="Telegram bots, workflow automation, and AI agent prototypes — built and shipped in days. Fixed price, done-for-you.">
+<style>
+  :root{--bg:#0a0a12;--panel:#12121f;--line:#262638;--tx:#e8e8f2;--dim:#8a8aa3;--acc:#b400ff;--acc2:#00ff64;--gold:#ffd700;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;line-height:1.6;}
+  .wrap{max-width:980px;margin:0 auto;padding:0 24px;}
+  header{padding:64px 0 40px;text-align:center;}
+  .logo{font-size:14px;letter-spacing:4px;color:var(--dim);text-transform:uppercase;}
+  h1{font-size:clamp(32px,5vw,56px);font-weight:800;margin:16px 0 12px;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .sub{font-size:clamp(16px,2.2vw,21px);color:var(--dim);max-width:640px;margin:0 auto;}
+  .cta-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:32px;}
+  .btn{display:inline-block;padding:14px 28px;border-radius:10px;font-weight:700;text-decoration:none;transition:transform .15s,box-shadow .15s;}
+  .btn:hover{transform:translateY(-2px);}
+  .btn-primary{background:var(--acc);color:#fff;box-shadow:0 4px 24px rgba(180,0,255,.35);}
+  .btn-ghost{border:1px solid var(--line);color:var(--tx);}
+  section{padding:48px 0;}
+  h2{font-size:28px;margin-bottom:8px;}
+  .sec-note{color:var(--dim);margin-bottom:28px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:18px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:26px;display:flex;flex-direction:column;}
+  .card .tag{font-size:12px;letter-spacing:2px;text-transform:uppercase;color:var(--gold);margin-bottom:8px;}
+  .card h3{font-size:20px;margin-bottom:6px;}
+  .card .price{font-size:26px;font-weight:800;color:var(--acc2);margin:10px 0 14px;}
+  .card ul{list-style:none;flex:1;}
+  .card li{padding:6px 0 6px 22px;position:relative;color:var(--tx);font-size:15px;}
+  .card li:before{content:"›";position:absolute;left:4px;color:var(--acc);font-weight:700;}
+  .card .btn{margin-top:20px;text-align:center;background:var(--acc2);color:#04140a;}
+  .proof{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;text-align:center;}
+  .stat b{display:block;font-size:26px;color:var(--acc2);}
+  .stat span{font-size:13px;color:var(--dim);}
+  .how{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;counter-reset:step;}
+  .step{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;}
+  .step b{color:var(--acc);display:block;margin-bottom:6px;font-size:18px;}
+  .step p{font-size:14px;color:var(--dim);}
+  footer{border-top:1px solid var(--line);padding:32px 0 48px;text-align:center;color:var(--dim);font-size:14px;}
+  @media(max-width:600px){header{padding:44px 0 28px;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">Komnsensei — Automation & AI</div>
+    <h1>You describe it. I ship it.</h1>
+    <p class="sub">Telegram bots, workflow automation, and AI agents with real tool access — fixed price, done-for-you, delivered in days.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="mailto:shawnru391@gmail.com?subject=Project%20inquiry">Get a quote</a>
+      <a class="btn btn-ghost" href="#offers">See the offers</a>
+    </div>
+  </header>
+
+  <section id="offers">
+    <h2>Pick the one you need</h2>
+    <p class="sec-note">Three fixed-price products. No hourly billing, no surprise invoices.</p>
+    <div class="grid">
+      <div class="card">
+        <div class="tag">7 days</div>
+        <h3>Telegram Bot</h3>
+        <div class="price">$349</div>
+        <ul>
+          <li>Answers your top questions 24/7</li>
+          <li>Escalates real requests to your team</li>
+          <li>Order / booking intake</li>
+          <li>Deployed, hosted, supported 14 days</li>
+        </ul>
+        <a class="btn" href="mailto:shawnru391@gmail.com?subject=Telegram%20bot%20($349)">Order this</a>
+      </div>
+      <div class="card">
+        <div class="tag">7–10 days</div>
+        <h3>Automation Rescue</h3>
+        <div class="price">$499</div>
+        <ul>
+          <li>One manual workflow, fully scripted</li>
+          <li>Scraping, forms, reports, leads</li>
+          <li>Runs on a schedule, logged</li>
+          <li>Deployed + 14 days support</li>
+        </ul>
+        <a class="btn" href="mailto:shawnru391@gmail.com?subject=Automation%20rescue%20($499)">Order this</a>
+      </div>
+      <div class="card">
+        <div class="tag">7 days</div>
+        <h3>AI Agent Prototype</h3>
+        <div class="price">$1,450</div>
+        <ul>
+          <li>Working agent, not a chat wrapper</li>
+          <li>Browses, searches, automates for real</li>
+          <li>2 discovery calls, 1 workflow</li>
+          <li>Demo + handover + 30 days fixes</li>
+        </ul>
+        <a class="btn" href="mailto:shawnru391@gmail.com?subject=Agent%20prototype%20($1450)">Order this</a>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>I ship complete systems</h2>
+    <p class="sec-note">Proven work, not promises.</p>
+    <div class="proof">
+      <div class="stat"><b>Live</b><span>API deployed + DOI-published (zenodo)</span></div>
+      <div class="stat"><b>3</b><span>Complete platforms shipped in this project alone</span></div>
+      <div class="stat"><b>12/12</b><span>Regression checks passing on the governance engine</span></div>
+      <div class="stat"><b>0</b><span>Surprise invoices — fixed price, fixed scope</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>How it works</h2>
+    <div class="how">
+      <div class="step"><b>1. Tell me the outcome</b><p>Email what you want done. I reply within 24h with scope + timeline.</p></div>
+      <div class="step"><b>2. Fixed price, half up front</b><p>Clear scope, clear price. You pay 50% to start, 50% on delivery.</p></div>
+      <div class="step"><b>3. Delivered in days</b><p>Working product + handover. Free fixes for 14–30 days depending on the offer.</p></div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="logo">Komnsensei</div>
+    <p style="margin-top:8px">shawnru391@gmail.com</p>
+  </footer>
+</div>
+</body>
+</html>

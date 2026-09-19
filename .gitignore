@@ -85,3 +85,7 @@ bro-build.mjs
 cli1.mjs
 tools.js
 _fix_python_files.sh
+
+# Python bytecode
+__pycache__/
+*.pyc

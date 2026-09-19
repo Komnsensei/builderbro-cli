@@ -13,7 +13,7 @@ import { execSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
-import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, modelPreferencePath } from "./model-selector.mjs";
+import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, loadModelPreference, saveModelPreference, modelPreferencePath, localModelConfig, chatLocal } from "./model-selector.mjs";
 
 // Minimal .env loader (same rules as cli1.mjs: real env vars always win).
 (function loadDotEnv(){
@@ -134,15 +134,30 @@ async function askOpenAICompat(baseUrl, key, prompt, ret){
   throw new Error("API failed");
 }
 
+// Local open-weight backend (Ollama / vLLM / llama.cpp) — fully offline,
+// zero cloud API calls. Same OpenAI-compatible contract as askOpenAICompat.
+async function askLocal(prompt, ret){
+  var cfg = localModelConfig();
+  if(!cfg) throw new Error("LOCAL_MODEL_URL not set");
+  for(var i=0;i<ret;i++){
+    try{
+      return (await chatLocal(cfg, [{role:"user", parts:[{text:prompt}]}], { maxTokens: 4096 })).content;
+    }catch(e){ if(i===ret-1) throw e; await sleep((i+1)*2000); }
+  }
+  throw new Error("Local model failed");
+}
+
 async function pipeAnswer(instruction, content){
   var prompt = "User piped content through BRO with instruction: "+instruction+"\n\nCONTENT:\n"+content.substring(0,30000);
   var lastErr = null;
-  // Priority: gcloud/Vertex first (user's preferred brain), then Base44, Groq, OpenAI.
+  // Priority: local open-weight first when configured (fully offline, zero
+  // cloud calls — Phase 0 of FREE-BRAIN.md), then gcloud/Vertex, Base44, Groq, OpenAI.
+  if (localModelConfig())     { try { return await askLocal(prompt, 2); } catch(e){ lastErr = e; } }
   try{ return await askVertex(prompt, 2); }catch(e){ lastErr = e; }
   if (TOKEN)            { try { return await askBase44(prompt, 2); } catch(e){ lastErr = e; } }
   if (GROQ_KEY)         { try { return await askOpenAICompat("https://api.groq.com/openai/v1", GROQ_KEY, prompt, 2); } catch(e){ lastErr = e; } }
   if (OPENAI_KEY)       { try { return await askOpenAICompat(process.env.OPENAI_BASE_URL || "https://api.openai.com/v1", OPENAI_KEY, prompt, 2); } catch(e){ lastErr = e; } }
-  console.error("No LLM brain available. Set up gcloud (gcloud auth login && gcloud config set project ID), or set BASE44_TOKEN / GROQ_KEY / OPENAI_API_KEY (env or .env). "+(lastErr?("Last error: "+lastErr.message):""));
+  console.error("No LLM brain available. Start a local open-weight server and set LOCAL_MODEL_URL (see .env.example), set up gcloud (gcloud auth login && gcloud config set project ID), or set BASE44_TOKEN / GROQ_KEY / OPENAI_API_KEY (env or .env). "+(lastErr?("Last error: "+lastErr.message):""));
   process.exit(1);
 }
 

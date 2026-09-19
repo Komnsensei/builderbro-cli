@@ -1,0 +1,23 @@
+{
+ "params": {
+  "compact_min_chars": 400,
+  "context_budget_chars": 24000,
+  "context_keep_recent": 2,
+  "empty_response_retries": 1,
+  "max_replans": 2,
+  "max_wall_clock_s": 600,
+  "no_action_limit": 2,
+  "plan_divergence_limit": 1,
+  "plan_repair_attempts": 1,
+  "repeat_limit": 2,
+  "repeat_mode": "streak",
+  "task_token_budget": 0,
+  "tool_error_streak": 3,
+  "unknown_tool_limit": 2,
+  "verify_mode": "confirm",
+  "verify_model_adjudication": 0,
+  "verify_reproduce": 1
+ },
+ "registered": "2026-09-18T21:19:47+00:00",
+ "source": "autonomy_suite.py"
+}

@@ -1,0 +1,43 @@
+{
+  "schemas": {
+    "system": {
+      "name": "string",
+      "type": "string",
+      "description": "string",
+      "components": "array<string>",
+      "dependencies": "array<string>",
+      "purpose": "string",
+      "keywords": "array<string>"
+    },
+    "component": {
+      "name": "string",
+      "parent_system": "string",
+      "description": "string",
+      "functionality": "string",
+      "inputs": "array<string>",
+      "outputs": "array<string>",
+      "technologies_used": "array<string>"
+    },
+    "concept": {
+      "name": "string",
+      "definition": "string",
+      "related_systems": "array<string>",
+      "related_components": "array<string>",
+      "keywords": "array<string>"
+    },
+    "relationship": {
+      "entity1": "string",
+      "entity2": "string",
+      "type": "string",
+      "description": "string"
+    },
+    "document_reference": {
+      "path": "string",
+      "title": "string",
+      "extracted_concepts": "array<string>",
+      "extracted_systems": "array<string>",
+      "extracted_components": "array<string>",
+      "processed_on": "datetime"
+    }
+  }
+}

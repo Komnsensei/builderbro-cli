@@ -1,0 +1,12 @@
+{
+ "params": {
+  "chunk_budget_words": 120,
+  "chunk_overlap_words": 24,
+  "dense_weight": 1.0,
+  "fusion": "linear",
+  "min_query_support": 0.55,
+  "top_k": 7
+ },
+ "registered": "2026-09-19T09:34:56+00:00",
+ "source": "rag_diagnose.py run_cycle"
+}
