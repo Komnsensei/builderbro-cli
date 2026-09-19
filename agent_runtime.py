@@ -1137,8 +1137,9 @@ def run_goal(config, goal, max_steps=MAX_STEPS, persona="Free Brain", guard=None
                                elapsed_s=time.monotonic() - started)
         if verdict["action"] == "stop":
             _emit_loop_diagnosis(run_id, step, verdict["diagnosis"])
-            _emit_step(run_id, config, step, reply, "tool",
-                       extra=guard.summary("stopped", step))
+            if guard.emit:
+                _emit_step(run_id, config, step, reply, "tool",
+                           extra=guard.summary("stopped", step))
             return guard.failure_line(verdict["diagnosis"], step)
         if verdict["action"] == "compact":
             print("[loop] context %d chars over budget %d — elided %d older tool "

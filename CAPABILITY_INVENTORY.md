@@ -10,7 +10,7 @@ mechanism but no measurement is `unmeasured`. Aspirational entries are
 `planned` and must not be depended on.
 
 Last updated: 2026-09-19 (A2: episodic memory with provenance, its audit arm, and
-the evidence-leak cycle that verifying it turned up; 442 tests)
+the evidence-leak cycle that verifying it turned up; 443 tests)
 
 See also: **`AUTONOMY-UPGRADE.md`** — a measured assessment of what autonomy still
 lacks and the dependency-ordered plan to add it. Written 2026-09-16 as a proposal;
@@ -19,8 +19,8 @@ Everything there beyond A3 is still `planned` and must not be depended on.
 
 Test suites (the reproduction command for every count below):
 `python3 -m unittest agent_runtime_test autonomy_test brain_cascade_test drift_loop_test loop_guard_test qih_metrics_test`
-→ 310 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
-plus `verifier_test` 27 and `live_refusal_probe_test` 8. **442 total, all pass.**
+→ 311 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
+plus `verifier_test` 27 and `live_refusal_probe_test` 8. **443 total, all pass.**
 
 ---
 
@@ -680,7 +680,7 @@ constant).
 | --- | --- |
 | status | verified |
 | implementation | `test_support.py` (a suite's *default* residence is never the shipped one) + `evidence_hygiene.py` (report, or quarantine rows positively identified as stubs) |
-| tests | `ReflexEvidenceGateTest` (2, in both directions) + the before/after row count run as part of every full-suite verification |
+| tests | `ReflexEvidenceGateTest` (3: a library run writes nothing; a recorded run still writes; and a **source contract** walking `run_goal` keeps every `_emit_step` call under an `emit` guard, so a new call site fails at definition time) + the before/after row count run as part of every full-suite verification |
 
 ### The reflex loop was the one ungated writer
 
@@ -696,10 +696,15 @@ evidence writes did not follow the guard's emit flag (`autonomy._call` is gated;
 are built with `emit=False`, which is exactly why the fix could not be a per-suite
 patch.
 
-Cumulative damage in the published log, measured: **7,033 artifact rows against
-374 real measurements (95%)**. Both fixes are in because they fail differently —
-the write is now gated on `guard.emit` (the source), and `autonomy_test.py`
-isolates its residence like the other five suites (the belt). The CLI paths keep
+Cumulative damage in the published log, measured: **7,069 artifact rows against a
+steady 374 real measurements (95%)**. Both fixes are in because they fail
+differently — the write is now gated on `guard.emit` (the source), and
+`autonomy_test.py` isolates its residence like the other five suites (the belt).
+The gating had to be done twice: the first pass guarded the two call sites that
+were obvious and left the guard-stop path writing, which the audit then reported
+as 8 more rows on its next run. A hand-fix cannot be trusted to have found every
+site, so the third test is a source contract over `run_goal` rather than another
+instance fix — verified in the failing direction, not just the passing one. The CLI paths keep
 their `setdefault("LOOP_GUARD_EMIT", "1")`, so a recorded run still records;
 that is asserted in both directions, so a fix that simply stopped recording real
 runs could not pass. The 7,033 rows are **kept**, not deleted, in
@@ -749,7 +754,7 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 | suite | tests | result |
 | --- | --- | --- |
 | `rag_test.py` | 55 | OK |
-| `agent_runtime_test.py` | 37 | OK |
+| `agent_runtime_test.py` | 38 | OK |
 | `brain_cascade_test.py` | 53 | OK |
 | `drift_loop_test.py` | 33 | OK |
 | `qih_metrics_test.py` | 21 | OK |
@@ -758,7 +763,7 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 | `memory_test.py` | 42 | OK |
 | `verifier_test.py` | 27 | OK |
 | `live_refusal_probe_test.py` | 8 | OK |
-| **total** | **442** | **all passing** |
+| **total** | **443** | **all passing** |
 
 Counts are per module, each run on its own (`python3 <module>.py`); the combined
 `python3 -m unittest discover -p "*_test.py"` runs the same set. Numbers here are

@@ -655,6 +655,37 @@ class ReflexEvidenceGateTest(unittest.TestCase):
             kinds = [json.loads(ln)["kind"] for ln in f if ln.strip()]
         self.assertEqual(kinds, ["final"])
 
+    def test_every_evidence_write_in_the_reflex_loop_is_gated(self):
+        """The class, not the instance.
+
+        The first fix gated the two call sites that were visible and left the
+        guard-stop path writing — caught by the audit appending 8 more rows on its
+        next run. A hand-fix cannot be trusted to have found every site, so this
+        walks the source: every `_emit_step` call inside `run_goal` must sit under
+        an `emit` test, and a *new* one fails here at definition time rather than
+        in the published log.
+        """
+        import ast
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "agent_runtime.py")
+        with open(path, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        loop = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                and n.name == "run_goal"]
+        self.assertEqual(len(loop), 1, "run_goal not found (renamed?)")
+        guarded = []
+        for node in ast.walk(loop[0]):
+            if isinstance(node, ast.If) and "emit" in ast.dump(node.test):
+                guarded.append((node.body[0].lineno, node.body[-1].lineno))
+        calls = [n for n in ast.walk(loop[0]) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", None) == "_emit_step"]
+        self.assertTrue(calls, "no evidence writes in run_goal — has it been renamed?")
+        ungated = [n.lineno for n in calls
+                   if not any(lo <= n.lineno <= hi for lo, hi in guarded)]
+        self.assertEqual(
+            ungated, [],
+            "run_goal writes evidence at line(s) %s without an emit guard" % ungated)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
