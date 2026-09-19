@@ -54,6 +54,11 @@ automatically instead of hand-timed measurements:
 
     EVIDENCE_FILE   default <residence>/evidence/q1-evidence.jsonl ("" disables)
 
+The goal-directed loop additionally takes `--memory [PATH]` (A2, memory.py): it
+recalls confirmed facts from the episodic store into the plan prompt and writes
+this run's independently confirmed steps back at their verified level. Absent by
+default — a run without it behaves exactly as it did before A2 existed.
+
 Residence: the agent's persistent home. A folder (DRIVE_RESIDENCE, default
 freebrain-residence/) holding state.json, instructions.md, ledger.jsonl,
 evidence/ and generated/ — the "self" that survives restarts and follows the
@@ -1049,6 +1054,14 @@ def run_goal(config, goal, max_steps=MAX_STEPS, persona="Free Brain", guard=None
     diagnosis instead of one generic "budget exceeded". Pass
     `loop_guard.LoopGuard(max_steps, enabled=False)` to measure an uninstrumented
     baseline (this is what loop_audit.py does).
+
+    Every step's throughput is written to the evidence file **gated on `guard.emit`**
+    (`LOOP_GUARD_EMIT`, off for a library or test run, as the CLI sets it to 1). This
+    loop used to write unconditionally, which made it the one path that could append
+    to the published Q1 evidence log from a test — and did: measured 2026-09-19,
+    `autonomy_test.py`'s reflex arm left 5 stub rows in
+    `freebrain-residence/evidence/q1-evidence.jsonl` per suite run, invisible in the
+    file because they carry `provider: "stub"` and a plausible token rate.
     """
     run_id = uuid.uuid4().hex[:10]
     guard = guard if guard is not None else loop_guard.LoopGuard(max_steps)
@@ -1090,10 +1103,12 @@ def run_goal(config, goal, max_steps=MAX_STEPS, persona="Free Brain", guard=None
         # models drop the markers).
         tool_lines = [ln for ln in content.splitlines() if _is_tool_line(ln)]
         if "FINAL:" in content or not tool_lines:
-            _emit_step(run_id, config, step, reply, "final",
-                       extra=guard.summary("final", step))
+            if guard.emit:
+                _emit_step(run_id, config, step, reply, "final",
+                           extra=guard.summary("final", step))
             return content
-        _emit_step(run_id, config, step, reply, "tool")
+        if guard.emit:
+            _emit_step(run_id, config, step, reply, "tool")
 
         executed = []
         # (name, arg, failed, result_hash) — the guard's evidence for this step.
@@ -1162,6 +1177,14 @@ def main(argv=None):
                              "own FINAL claim is the result, unverified. This is the "
                              "measurable baseline loop_audit.py compares the verified loop "
                              "against (false-success rate > 0)")
+    parser.add_argument("--memory", nargs="?", const="", default=None, metavar="PATH",
+                        help="with --goal: read the episodic store for confirmed facts "
+                             "this goal has a history with, and write this run's "
+                             "confirmed steps back to it (memory.py, A2). No value means "
+                             "<residence>/memory.jsonl. Off unless asked for: a run with no "
+                             "store attached behaves exactly as it did before A2. Memory "
+                             "informs planning only — the goal gate still reads this "
+                             "run's own evidence, so a recalled fact is never a completion")
     parser.add_argument("--activate", action="store_true", help="QIH bootstrap: gate + record the activation, then run one Perceive->Plan->Act->Evaluate loop (QIH.md)")
     parser.add_argument("--providers", action="store_true", help="print the brain cascade order and cooldown state (no requests)")
     parser.add_argument("--ping", action="store_true", help="with --providers: probe each provider's /models endpoint")
@@ -1259,8 +1282,25 @@ def main(argv=None):
         # exits non-zero so a shell caller can branch on it rather than reading
         # prose to find out whether the run succeeded.
         import autonomy
-        result = autonomy.run_goal_verified(config, args.goal)
+        # Opt-in, and the path is the caller's: `--memory` alone uses the residence
+        # (so a history follows the agent), a path pins it anywhere. A run with no
+        # flag passes `None` and is byte-for-byte the pre-A2 behaviour.
+        store = None
+        if args.memory is not None:
+            store = args.memory or os.path.join(residence, "memory.jsonl")
+        result = autonomy.run_goal_verified(config, args.goal, memory_store=store)
         print(autonomy.format_result(result))
+        recall = result.get("recall") or {}
+        if recall.get("enabled"):
+            # What memory contributed, on stderr so it cannot be mistaken for the
+            # answer. `suppressed` is named because "did not read its history" and
+            # "had no history" look identical from the outcome alone.
+            print("[memory] %s: %d record(s), %d recalled (%d fact(s), %d unverified), "
+                  "%d confirmed step(s) written back, %d provenance violation(s)"
+                  % (store, recall.get("available", 0), recall.get("recalled", 0),
+                     recall.get("facts", 0), recall.get("unverified", 0),
+                     recall.get("written", 0), len(recall.get("violations") or [])),
+                  file=sys.stderr)
         return 0 if result.get("ok") else 1
 
     return 0

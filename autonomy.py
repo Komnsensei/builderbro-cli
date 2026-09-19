@@ -18,7 +18,10 @@ This module adds the three things that make a loop goal-directed:
    *model's own* expectation, a claim must also survive independent confirmation
    before it counts;
 4. a **completion gate** — `FINAL` is accepted only when the goal condition holds
-   over verified evidence.
+   over verified evidence;
+5. **episodic memory with provenance** (`memory.py`, A2) — confirmed steps from
+   earlier runs are recalled into the planning context at three levels, and only
+   an `invariant` may be presented as a fact or used as a constraint.
 
 Design notes that are load-bearing, not decorative:
 
@@ -34,6 +37,13 @@ Design notes that are load-bearing, not decorative:
   as `plan_invalid`: a goal you cannot check is not a goal. The price is real and
   worth stating — this layer can only run goals that come with a checkable
   condition, and anything else fails fast instead of passing quietly.
+* **Memory informs planning; the gate reads only this run's evidence.** A goal
+  condition that would hold over recalled facts alone is *not* a completion — it
+  is refused as `unverified_completion` carrying `recall_gap`, because the whole
+  point of separating `invariant` from `volatile` is that a fact confirmed in an
+  earlier run is a hint about where to look, not an observation of what is there
+  now. Promoting it to this run's evidence would be exactly the false recall A2
+  exists to prevent.
 * **Deviation is attributed, not censored.** The model may act off-plan; the
   harness counts it, records it, and stops only past `plan_divergence_limit`.
   A harness that silently refused would hide the fault the audit needs to see.
@@ -54,6 +64,7 @@ import uuid
 
 import agent_runtime as rt
 import loop_guard
+import memory
 import verifier
 
 # ── The expectation grammar ───────────────────────────────────────────────────
@@ -352,7 +363,9 @@ def parse_plan(text):
 def plan_system_prompt(persona="BuilderBro"):
     return (
         "You are %s, a local autonomous agent. You have these read-only tools: %s. "
-        "You never answer from memory: every claim must come from a tool result.\n\n"
+        "You never answer from the conversation alone: every claim must rest on a "
+        "tool result collected on this run. Recalled context, when present, is for "
+        "deciding what to look at — it is never a substitute for looking.\n\n"
         "FIRST, and before using any tool, reply with ONLY this block:\n"
         "PLAN:\n"
         "1. tool: <name> <argument>\n"
@@ -567,7 +580,7 @@ def _failure(guard, reason, detail, step, run_id, stats):
 def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
                       token_budget=None, thresholds=None, env=None,
                       persona="BuilderBro", guard=None, chat_fn=None, plan=None,
-                      emit=None, run_id=None):
+                      memory_store=None, emit=None, run_id=None):
     """Plan → act → verify → replan, gated on evidence.
 
     Returns a result dict (never raises for a model/tool fault):
@@ -586,11 +599,24 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
                             checks named in `how_verified`
         claims_rejected     promotions the adversarial verifier refused, with the
                             check that refused them (A3, `verifier.py`)
+        recall              what episodic memory contributed (A2, `memory.py`):
+                            records available, recalled, how many were facts vs
+                            unverified, the rendered block's size, the records
+                            written back, and any provenance violation found in
+                            the block it built
         steps_used, tool_steps, tokens, plan
 
     `chat_fn(config, messages, max_tokens=...)` is injectable so the audit and
     the suite can drive real pathologies through this exact code path instead of
     a paraphrase of it. `plan` may be supplied to skip the planning call.
+
+    `memory_store` is `None` | a path | a `memory.MemoryStore`. **`None` is the
+    default and means no memory**, so every existing caller is unchanged and a
+    run only has a history when one is named. When a store is given, recall is
+    read once at plan time and each independently confirmed step is written back;
+    a store's location is the caller's choice, which is why these writes are not
+    gated on `emit` (that flag guards the *published* record — the evidence log,
+    the diagnosis ledger, the self-improvement log).
 
     `emit` (default from LOOP_GUARD_EMIT) gates evidence/ledger writes, so a
     library or test run writes nothing — the same rule the guard learned the hard
@@ -646,8 +672,57 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
             {"tool": tool, "arg": arg, "output": output, "expect": expect},
             rerun=rerun, model_adjudication=model_adj, adjudicate=judge)
 
+    # ── A2: recall, before the plan is asked for ──────────────────────────────
+    # Read once, at plan time. The block goes into the *system* message, which
+    # `loop_guard.compact_messages` never touches (index 0), so a long run cannot
+    # compact away the facts it was given. Within a run the evidence list is the
+    # working memory; the store is only what an *earlier* run left behind, and
+    # mixing the two would let a run recall what it had just done.
+    store = memory.open_store(memory_store)
+    recalled, recalled_facts, recall_block = [], [], ""
+    stats["recall"] = {"enabled": store is not None, "suppressed": False,
+                       "available": 0, "recalled": 0, "facts": 0,
+                       "unverified": 0, "chars": 0, "written": 0,
+                       "items": [], "violations": [], "checked": 0,
+                       "unchecked": 0}
+    if store is not None:
+        records = store.records()
+        stats["recall"]["available"] = len(records)
+        if int(t.get("recall_enabled", 1)) == 1:
+            recalled = memory.recall(records, goal,
+                                     limit=int(t.get("recall_limit", 3)),
+                                     min_score=float(t.get("recall_min_score", 0.25)))
+            recall_block = memory.render(
+                recalled,
+                value_chars=int(t.get("recall_value_chars", 400)),
+                max_chars=int(t.get("recall_max_chars", 2000)))
+            recalled_facts = memory.facts(recalled)
+            # The block is checked against the items it claims to render, every
+            # time, rather than trusted because of how it was built.
+            check = memory.audit(recalled, recall_block)
+            stats["recall"].update({
+                "recalled": len(recalled), "facts": len(recalled_facts),
+                "unverified": len(memory.unverified(recalled)),
+                "chars": len(recall_block),
+                "violations": check["violations"], "checked": check["checked"],
+                "unchecked": check["unchecked"],
+                "items": [{"tool": r.get("tool"), "arg": r.get("arg"),
+                           "level": r.get("level"), "score": r.get("score"),
+                           "how_verified": r.get("how_verified")}
+                          for r in recalled],
+            })
+        else:
+            # A store was supplied and recall was suppressed by config. Recorded
+            # rather than left silent: "why did the run not use what it knew" has
+            # to be answerable from the run's own output, or the A/B measurement
+            # of recall cannot tell "memory was empty" from "memory was off".
+            stats["recall"]["suppressed"] = True
+
+    system = plan_system_prompt(persona)
+    if recall_block:
+        system = system + "\n\n" + recall_block
     messages = [
-        {"role": "system", "content": plan_system_prompt(persona)},
+        {"role": "system", "content": system},
         {"role": "user", "content": goal},
     ]
 
@@ -925,9 +1000,27 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
                     return stats
             if not goal_ok:
                 stats["false_success_claims"] += 1
+                # A2's boundary, checked rather than asserted: memory informs
+                # planning and never feeds the gate. If the condition would hold
+                # over recalled facts *alone*, that is the diagnosis — the answer
+                # is in the history and was not re-observed this run — and not a
+                # completion. Recalled values are consulted only to say so.
+                recall_gap = False
+                if recalled_facts:
+                    # `verify` takes one text, so the recalled values are joined
+                    # exactly as this run's evidence would be: the comparison has
+                    # to be like-for-like, or the gap would be an artefact of the
+                    # joining rather than of the evidence.
+                    held, _over_recall = verify(
+                        plan.goal_check,
+                        "\n".join(r.get("value") or "" for r in recalled_facts))
+                    recall_gap = bool(held)
                 verdict, line = _failure(
                     guard, "unverified_completion",
                     {"goal_check": format_spec(plan.goal_check),
+                     "recall_gap": recall_gap,
+                     "recall_chars": sum(len(r.get("value") or "")
+                                         for r in recalled_facts),
                      "check_detail": detail,
                      "verified_steps": stats["verified_steps"],
                      "unmet_expectations": len(stats["unmet_expectations"]),
@@ -1008,6 +1101,20 @@ def run_goal_verified(config, goal, *, max_tool_steps=None, max_calls=None,
                                          else "declared_expectation_only"),
                         "chars": len(out)})
                     evidence.append(out)          # only confirmed output is evidence
+                    if store is not None:
+                        # Written at promotion, not at run end: a step confirmed by
+                        # an independent check *is* a fact, whether or not the run
+                        # that discovered it went on to meet its goal. The level is
+                        # derived from the verifier, never chosen here.
+                        store.add(memory.make_record(
+                            goal, name, arg, out,
+                            level=memory.level_for(level),
+                            how_verified=(verdict.how_verified if verdict is not None
+                                          else "declared_expectation_only"),
+                            step=plan_index + 1, run_id=run_id,
+                            expect=format_spec(planned.expect),
+                            value_chars=int(t.get("recall_value_chars", 400))))
+                        stats["recall"]["written"] += 1
                     plan_index += 1
                     note = _status_note(plan, plan_index, True, detail)
                 else:
@@ -1085,12 +1192,19 @@ def format_result(result):
         levels = m.get("evidence_levels") or {}
         how = ", ".join("%d %s" % (n, lvl) for lvl, n in sorted(levels.items()) if n) \
             or "none"
+        # Named only when memory was actually in play, so a run without a store
+        # prints exactly the line it printed before A2 existed.
+        r = m.get("recall") or {}
+        recall_note = ("" if not r.get("enabled") else
+                       ", %d recalled item(s) (%d fact(s))"
+                       % (r.get("recalled", 0), r.get("facts", 0)))
         return ("%s\n[verified] goal check `%s` held over %d confirmed step(s) "
                 "[evidence: %s] (%d call(s), %d tool step(s), %d replan(s), "
-                "%d divergence(s), %d claim(s) rejected, %d tokens)"
+                "%d divergence(s), %d claim(s) rejected%s, %d tokens)"
                 % (m["answer"], m["plan"]["goal_check"], m["verified_steps"], how,
                    m["steps_used"], m["tool_steps"], m["replans"],
-                   len(m["divergences"]), len(m["claims_rejected"]), m["tokens"]))
+                   len(m["divergences"]), len(m["claims_rejected"]), recall_note,
+                   m["tokens"]))
     return result.get("failure") or loop_guard.fail("reason=unknown autonomy failure")
 
 

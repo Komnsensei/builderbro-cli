@@ -3,12 +3,18 @@
   "compact_min_chars": 400,
   "context_budget_chars": 24000,
   "context_keep_recent": 2,
+  "empty_reply_token_ceiling": 2048,
   "empty_response_retries": 1,
   "max_replans": 2,
   "max_wall_clock_s": 600,
   "no_action_limit": 2,
   "plan_divergence_limit": 1,
   "plan_repair_attempts": 1,
+  "recall_enabled": 1,
+  "recall_limit": 3,
+  "recall_max_chars": 2000,
+  "recall_min_score": 0.25,
+  "recall_value_chars": 400,
   "repeat_limit": 2,
   "repeat_mode": "streak",
   "task_token_budget": 0,
@@ -18,6 +24,6 @@
   "verify_model_adjudication": 0,
   "verify_reproduce": 1
  },
- "registered": "2026-09-18T21:19:47+00:00",
+ "registered": "2026-09-19T10:06:14+00:00",
  "source": "autonomy_suite.py"
 }

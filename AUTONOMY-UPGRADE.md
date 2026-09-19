@@ -4,10 +4,10 @@
 was read out of the source or a ledger on **2026-09-16** and names its evidence; the
 counts in §1 and the absences in §2 are that snapshot and have deliberately been
 left as written, so what was *predicted* can be compared against what was
-*measured*. **A1 and A3 have since been delivered** — §4 carries their status and
-their measured numbers, §2's first three rows are closed by A1, and A3's own
-prediction is compared against its measurement below. Every other proposal is
-still `planned` and must not be depended on (same rule as
+*measured*. **A1, A2 and A3 have since been delivered** — §4 carries their status
+and their measured numbers, §2's first three rows are closed by A1, and A2's and
+A3's own predictions are compared against their measurements below. Every other
+proposal is still `planned` and must not be depended on (same rule as
 `CAPABILITY_INVENTORY.md`, which is the record of what exists *now*).
 
 Read this after `CAPABILITY_INVENTORY.md`. That file answers "what can it do".
@@ -96,17 +96,31 @@ Each phase ends runnable and independently testable, and each adds its **own**
 comparison arm to `loop_audit.py` — the audit's guard-OFF baseline cannot isolate
 an intermediate rule, and that is already recorded as a known weakness.
 
-> **Status (2026-09-18).** A1 is **implemented and measured**; §5.1 (the task
-> suite) and §5.2 (per-task budgets) ship with it. **A3 is also delivered**
-> (`verifier.py`, its own audit arm and its own closed cycle), so of the phases
-> below, A1 and A3 are done and A2 and A4–A8 are still `planned`. A3 was built
-> before A2 deliberately: A2 — episodic memory — is the layer that will present
-> recalled values as facts, and promoting a recalled value to an invariant is the
-> exact operation A3 now gates with a named confirmation. Building the gate first
-> means the thing A2 needs already exists and is measured. The delivered numbers,
-> the audit arms that back them, and the weaknesses found by the first live runs
-> are in `CAPABILITY_INVENTORY.md` ("Goal-directed loop" and "Adversarial verifier
-> (A3)") and in the closed cycles in `SELF_IMPROVEMENT_LOG.md`.
+> **Status (2026-09-19).** A1 is **implemented and measured**; §5.1 (the task
+> suite) and §5.2 (per-task budgets) ship with it. **A3 and A2 are also
+> delivered** (`verifier.py`, then `memory.py`, each with its own audit arm and
+> its own closed cycle), so of the phases below, A1, A2 and A3 are done and
+> A4–A8 are still `planned`. A3 was built before A2 on purpose, and that ordering
+> paid: A2's levels are derived from the verifier rather than chosen, so the map
+> is `invariant` (confirmed and reproduced) → `invariant`, `observed` (real, not
+> re-observed) → `observed`, and `declared` (the verifier off) → **`volatile`** —
+> without that last row, turning the verifier off would have been a way to
+> launder a model's claim into a remembered fact. The delivered numbers, the
+> audit arms that back them, and the weaknesses found by the first live runs are
+> in `CAPABILITY_INVENTORY.md` ("Goal-directed loop", "Adversarial verifier (A3)",
+> "Episodic memory with provenance (A2)") and in the closed cycles in
+> `SELF_IMPROVEMENT_LOG.md`.
+>
+> **A2 is now implemented and measured** (`memory.py`): one audit task run twice
+> over one store, in four cases. With recall **off** the second run is refused
+> (`unverified_completion`); with it **on** the same task succeeds, because the
+> fact the first run confirmed is in front of the planner. With **no history at
+> all** it fails, so the improvement is the record and not the store's existence;
+> and with the **same value seeded with the verifier off** it is recalled and
+> *unusable* — offered below the unverified header, never in a fact position.
+> False recall **0** with the value actually searched for. `audit_ok` now requires
+> the arm's verdict to be `useful`, so recall that changes no outcome fails the
+> audit. The prediction this measurement contradicted is below.
 >
 > Headline: reflex loop **5/5 false successes** on the same scripted replies;
 > verified loop **0/5**, with **18/18** goal-arm pathologies classified correctly
@@ -144,13 +158,18 @@ an intermediate rule, and that is already recorded as a known weakness.
 Why first: it is the only change that makes later ones safe, and the harness to
 measure it (scripted pathologies through the real loop) already exists.
 
-### A2 — Episodic memory with provenance
+### A2 — Episodic memory with provenance  *(delivered)*
 
 | field | value |
 | --- | --- |
 | change | the ledger becomes readable: past actions and outcomes recalled into the prompt, tagged `invariant` / `observed` / `volatile` (AGENT-INTEGRITY semantics), with only `invariant` promotable to fact |
 | measurement | scripted tasks whose second run needs the first run's outcome; false-recall (an unverified value presented as fact) must be 0 |
 | exit | task success improves with recall versus without, on the same suite; false-recall 0 |
+| delivered | `memory.py` (three levels taken verbatim from `AGENT-INTEGRITY.md`, an append-only JSONL store, lexical recall, a render whose facts/unverified split is structural, `ProvenanceError` on using a non-invariant as a fact, gated promotion, and an `audit()` that re-checks a rendered block against the records it claims to render); wired into `autonomy.run_goal_verified` behind `memory_store=None`, so no pre-A2 caller changes; `loop_guard` registers 5 recall thresholds; `loop_audit.py --memory` adds the arm; `autonomy_suite.py --register-memory` closes the cycle |
+| metrics | recall **ON succeeded where OFF failed** on the same task and store; no-history control failed; never-confirmed control recalled but **unusable** (0 facts offered); false recall **0** with 1 value actually checked for leakage; seeded with the verifier off → stored `volatile`, with it on → `invariant`; verdict **`useful`** |
+| exit | **met** — success improves with recall and false recall is 0, with the no-history case as the control that the improvement is attributable. The prediction this measurement **added to**: the exit criterion said nothing about memory reaching the *goal gate*, and the hole it did not name is the tempting shortcut — a goal condition that holds over recalled facts alone. That is now refused with `recall_gap: true` in the diagnosis, tested in both directions, because a fact confirmed in an earlier run is a hint about where to look, not an observation of what is there now |
+| cost of the measurement | verifying A2 turned up a second evidence leak: `agent_runtime.run_goal` wrote `_emit_step` records unconditionally, so a suite run appended 5 stub rows to the published Q1 log. 7,033 such rows had accumulated against 374 real measurements; they are quarantined (kept, not deleted) in `evidence/test-artifacts.jsonl`, the write is gated at the source, and it is asserted in both directions. Recorded as its own cycle because it is separate work |
+| still open | recall is lexical (deliberate: §6 below); the store is read once at plan time, so a run cannot recall its own earlier steps; records are truncated to `recall_value_chars`; no decay and no size cap; the arm's consumer is a deterministic stand-in, so it measures the channel rather than a real model's use of it |
 
 ### A3 — An adversarial verifier  *(delivered)*
 

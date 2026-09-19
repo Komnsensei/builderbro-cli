@@ -128,6 +128,25 @@ DEFAULT_THRESHOLDS = {
     # Off by default: this repo runs local-only, and an adjudicator that has never
     # run against a live model is surface, not capability (see verifier.py).
     "verify_model_adjudication": 0,
+    # ── episodic memory (memory.py, A2) ──────────────────────────────────────
+    # Recall is opt-in by supplying a store; this flag exists so the *same* store
+    # can be read with and without recall, which is how A2's improvement is
+    # measured (`loop_audit.py --memory`). 0 with a store attached means "this run
+    # had a history and was not allowed to read it".
+    "recall_enabled": 1,
+    # Recalled items offered to the planner, most relevant first.
+    "recall_limit": 3,
+    # Minimum fraction of the goal's content words a record's own text must cover
+    # before it is offered. Lexical, like rag_core.py: 0.25 means a record has to
+    # share a quarter of the goal's content words with the goal being run.
+    "recall_min_score": 0.25,
+    # Per-record value kept (chars). Long output is truncated, not dropped: a
+    # recalled value is a hint about where to look, and the run is expected to
+    # re-observe it before the goal gate will accept anything.
+    "recall_value_chars": 400,
+    # Cap on the whole rendered block, so recall cannot push the plan prompt over
+    # the context budget.
+    "recall_max_chars": 2000,
 }
 
 REGISTERED_NAME = "loop_guard.json"

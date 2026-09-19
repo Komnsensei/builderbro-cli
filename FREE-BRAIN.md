@@ -705,6 +705,64 @@ refusal. Its three rulings are tested with stubbed models; it has not been run
 against a live model, so it is registered off rather than written up as a
 capability.
 
+#### Memory that cannot launder a claim
+
+The ledger was write-only: every run started from zero knowledge even when an
+earlier run had already established the fact it needed. A2 makes it readable
+(`memory.py`), and the interesting part is not the recall — it is what a remembered
+value is *allowed to be*.
+
+`AGENT-INTEGRITY.md` had already recorded the failure this project kept making:
+cross-instance memory was untyped in practice (every `memorize()` call site wrote
+type `observation`), so the bucket that should hold invariants was never written by
+anyone. So the level is not a label a writer chooses — it is derived from A3's
+verifier: confirmed-and-reproduced → `invariant`, real but not re-observed →
+`observed`, and **the model's own expectation with the verifier off → `volatile`**.
+That last row is the whole boundary: without it, turning the verifier off would be
+a way to launder a claim into a remembered fact. On top of that the render's split
+is structural rather than advisory — the "Known facts" section is built from
+`facts()` alone and `unverified()` is its exact complement, so no argument to the
+renderer puts a claim above the header, and `as_fact()` raises rather than warns.
+
+Measured on one task, two runs, four cases (`python3 loop_audit.py --memory`):
+
+| case | history | recall | named the file | outcome |
+| --- | --- | --- | --- | --- |
+| cold | none (empty store) | on | — | refused |
+| confirmed fact | 1 `invariant` record | **off** | — | refused |
+| confirmed fact | 1 `invariant` record | **on** | `notes.md` | **succeeded** |
+| same value, never confirmed | 1 `volatile` record | on | — | refused |
+
+The third row is the capability; the fourth is the control that makes it worth
+claiming — a store holding **the same value**, seeded with the verifier off, is
+recalled, offered *below* the unverified header, and **unusable**. False recall
+**0**, with the value actually searched for rather than skipped as too short to
+check. The first two rows are the attribution: with no history the task fails, and
+with history but recall off it fails too, so the improvement is the record and not
+the store's existence. `audit_ok` requires the arm's verdict to be `useful`, so
+recall that changes no outcome fails the audit — the same rule as the verifier's
+`no_verifier`.
+
+Two limits worth stating. **Recall is lexical** — the fraction of the goal's
+content words a record's own text covers — stdlib-only, and that is a deliberate
+call rather than an omission: the binding constraint measured for retrieval was
+verification, not ranking, and `AUTONOMY-UPGRADE.md` §6 names what a measurement
+would have to say before an embedding dependency is justified. And **memory informs
+planning, never the gate**: a goal condition that would hold over recalled facts
+alone is refused with `recall_gap` rather than promoted, because a fact confirmed
+in an earlier run is a hint about where to look, not an observation of what is
+there now.
+
+One thing the A2 work found that is worth recording here, because it is the same
+defect this document's evidence rules exist for: verifying A2 ran the full suite
+with a before/after checksum over the published records, and the Q1 evidence log
+grew by 5 stub rows. `agent_runtime.run_goal` was the one path in the runtime that
+wrote `_emit_step` **unconditionally** — every other writer follows the guard's
+emit flag. 7,033 such rows had accumulated against 374 real measurements; they are
+kept (not deleted) in `evidence/test-artifacts.jsonl`, the write is gated at the
+source, and it is asserted in both directions so a fix that stopped recording real
+runs could not pass.
+
 ---
 
 ## 7. Experiment & Simulation Protocol  *(brief §7, expanded)*

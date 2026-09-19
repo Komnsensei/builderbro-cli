@@ -9,17 +9,18 @@ command that has been run and a number that came out of it. A capability with a
 mechanism but no measurement is `unmeasured`. Aspirational entries are
 `planned` and must not be depended on.
 
-Last updated: 2026-09-17 (autonomy overhaul: plan + per-step verification + gated
-completion, then a weakness-closure cycle; 298 tests)
+Last updated: 2026-09-19 (A2: episodic memory with provenance, its audit arm, and
+the evidence-leak cycle that verifying it turned up; 442 tests)
 
 See also: **`AUTONOMY-UPGRADE.md`** — a measured assessment of what autonomy still
 lacks and the dependency-ordered plan to add it. Written 2026-09-16 as a proposal;
-its A1 phase is now delivered and marked as such in §4 of that file. Everything
-there beyond A1 is still `planned` and must not be depended on.
+its A1, A2 and A3 phases are now delivered and marked as such in §4 of that file.
+Everything there beyond A3 is still `planned` and must not be depended on.
 
 Test suites (the reproduction command for every count below):
 `python3 -m unittest agent_runtime_test autonomy_test brain_cascade_test drift_loop_test loop_guard_test qih_metrics_test`
-→ 256 tests, and `python3 -m unittest rag_test` → 42 tests. **298 total, all pass.**
+→ 310 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
+plus `verifier_test` 27 and `live_refusal_probe_test` 8. **442 total, all pass.**
 
 ---
 
@@ -590,6 +591,121 @@ why it is registered off rather than described as a capability.
 | the second model is unmeasured live | **registered off** — see above |
 | one re-observation is not proof of stability | a tool could answer honestly twice and differently a third time. The check buys *reproducibility on demand*, which is weaker than determinism and is what the local tools can offer |
 
+## Episodic memory with provenance (A2) — `verified`
+
+| field | value |
+| --- | --- |
+| status | verified |
+| implementation | `memory.py` — an append-only JSONL store of past actions and outcomes at three provenance levels, lexical recall, and a render whose facts/unverified split is structural |
+| wired into | `autonomy.run_goal_verified(..., memory_store=...)` — recall read once at plan time into the *system* message (which compaction never touches); each independently confirmed step written back at its verified level. `memory_store=None` is the default, so every pre-A2 caller behaves identically |
+| entry point | `python3 agent_runtime.py --goal "<goal>" --memory [PATH]` — no value uses `<residence>/memory.jsonl`; the run reports what it read and wrote on stderr (`[memory] …`), naming `suppressed` so "did not read its history" cannot be confused with "had no history". Without the flag no store is created at all |
+| tests | `memory_test.py` (42) + 7 in `autonomy_test.py` + the memory arm of `loop_audit.py` (one task, four cases) — reproduction: `python3 memory_test.py`, `python3 loop_audit.py --memory` |
+
+### The levels are the boundary, not a label
+
+`AGENT-INTEGRITY.md` names them and this module does not invent its own:
+`invariant` (may be consumed as a constraint anywhere), `observed` (real tool
+output, not cross-checked), `volatile` (model claim, guess, parse or apology).
+Two rules are enforced rather than described:
+
+* **Nothing is born invariant.** The level comes from A3's verifier:
+  confirmed-and-reproduced → `invariant`; real but not re-observed → `observed`;
+  the model's own expectation with the verifier off (`declared`) → `volatile`.
+  That last row is the load-bearing one: without it, turning the verifier off
+  would be a way to launder a claim into a remembered fact.
+* **The facts section is built from `facts()` alone**, and `unverified()` is its
+  exact complement, so no argument to `render()` puts a claim above the header.
+  `as_fact()` raises `ProvenanceError` on anything non-invariant; `promote()`
+  refuses a `volatile` record outright and refuses an unnamed check.
+
+### Measured (the number is the capability)
+
+One task, two runs, four cases — recall is only measurable as "the second run
+needs an outcome the first one produced":
+
+| case | history | recall | recalled | facts | named the file | outcome |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cold` | none (empty store) | on | 0 | 0 | — | refused (`unverified_completion`) |
+| `confirmed_off` | 1 confirmed fact | off | 0 | 0 | — | refused (`unverified_completion`) |
+| `confirmed_on` | 1 confirmed fact | on | 1 | 1 | `notes.md` | **succeeded** |
+| `declared_on` | 1 never-confirmed value | on | 1 | 0 | — | refused (`unverified_completion`) |
+
+```
+improvement : recall ON succeeded where OFF failed — same store, same task
+false recall: 0   (1 value actually searched for in the facts section; 0 too short to check)
+seeding     : verifier off -> stored as `volatile`;  verifier on -> `invariant`
+verdict     : useful
+```
+
+`confirmed_off` vs `confirmed_on` is the improvement; `declared_on` is the
+false-recall control — a store holding **the same value**, seeded with the
+verifier off so it was never independently confirmed. Without that case, a memory
+that presented every remembered value as a fact would score a perfect improvement
+rate. `memory_assessment` reports recall that changes no outcome as `no_memory`
+and any leak as `unsafe`, and `audit_ok` requires `useful` — the same meta-rule as
+A3, so a green audit cannot be bought by remembering everything.
+
+### The limit of that measurement
+
+The consumer in the arm is a deterministic stand-in: it can name the file only if
+a `*.md` fact is above the unverified header. So the arm measures the **channel**
+— that a confirmed fact reaches the planner, labelled, and that an unconfirmed
+value is unusable — and *not* a real model's willingness to use what it is given.
+Driving the refusal path against a real model is `live_refusal_probe.py`'s job,
+and it does not yet exercise recall (it runs the loop with no store attached).
+
+### A goal cannot be met out of memory
+
+`recall_gap` names a distinct fault: the goal condition *would* hold over recalled
+facts alone. That is refused as `unverified_completion` with `recall_gap: true`
+rather than promoted to evidence — a fact confirmed in an earlier run is a hint
+about where to look, not an observation of what is there now. Tested in both
+directions: `test_memory_never_satisfies_the_goal_gate`, plus the control where
+the recalled fact does not hold the answer (so the diagnosis cannot be a
+constant).
+
+### Known weaknesses — do not paper over these
+
+| weakness | status |
+| --- | --- |
+| recall is lexical | deliberate, and the same call the RAG pipeline made: the binding constraint measured for retrieval was verification, not ranking. `AUTONOMY-UPGRADE.md` §6 says not to add an embedding dependency without a measurement that says lexical is what is failing — that measurement does not exist yet |
+| within a run, memory is the evidence list | the store is read **once**, at plan time. A run cannot recall what it did two steps ago through this path, and mixing the two would let a run treat its own fresh output as history |
+| a level is only as good as the verifier behind it | an `invariant` rests on A3's checks, including the residual named there (a specific but irrelevant needle can still promote); an un-reproducible tool tops out at `observed` |
+| records are truncated to `recall_value_chars` | a recalled value is a hint to re-observe, but a long output recalled as a hint can be a misleading fragment |
+| no decay and no size cap | the store grows append-only, one record per confirmed step. At present volumes this is not a problem; nothing measures whether it becomes one |
+
+## Evidence hygiene — `verified`
+
+| field | value |
+| --- | --- |
+| status | verified |
+| implementation | `test_support.py` (a suite's *default* residence is never the shipped one) + `evidence_hygiene.py` (report, or quarantine rows positively identified as stubs) |
+| tests | `ReflexEvidenceGateTest` (2, in both directions) + the before/after row count run as part of every full-suite verification |
+
+### The reflex loop was the one ungated writer
+
+Found by running the full suite with a before/after checksum over the published
+records while verifying A2: the Q1 evidence log grew by **5 rows** — all
+stub-provider rows with a plausible token rate and nothing visibly wrong about
+them, which is the signature of the leak `test_support.py` was built to stop. So
+it had a second source. Bisected to `autonomy_test.AuditInstrumentTest`: its
+reflex arm runs the unverified loop five times, and `agent_runtime.run_goal`
+called `_emit_step` **unconditionally** — the one path in the runtime whose
+evidence writes did not follow the guard's emit flag (`autonomy._call` is gated;
+`_emit_loop_diagnosis` only prints). That module read as safe because its guards
+are built with `emit=False`, which is exactly why the fix could not be a per-suite
+patch.
+
+Cumulative damage in the published log, measured: **7,033 artifact rows against
+374 real measurements (95%)**. Both fixes are in because they fail differently —
+the write is now gated on `guard.emit` (the source), and `autonomy_test.py`
+isolates its residence like the other five suites (the belt). The CLI paths keep
+their `setdefault("LOOP_GUARD_EMIT", "1")`, so a recorded run still records;
+that is asserted in both directions, so a fix that simply stopped recording real
+runs could not pass. The 7,033 rows are **kept**, not deleted, in
+`freebrain-residence/evidence/test-artifacts.jsonl` — they are the record of the
+bug. The published log now holds 374 rows, **100% measurements**.
+
 ## Brain cascade — `verified`
 
 | field | value |
@@ -633,26 +749,28 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 | suite | tests | result |
 | --- | --- | --- |
 | `rag_test.py` | 55 | OK |
-| `agent_runtime_test.py` | 35 | OK |
+| `agent_runtime_test.py` | 37 | OK |
 | `brain_cascade_test.py` | 53 | OK |
 | `drift_loop_test.py` | 33 | OK |
 | `qih_metrics_test.py` | 21 | OK |
 | `loop_guard_test.py` | 56 | OK |
-| `autonomy_test.py` | 101 | OK |
+| `autonomy_test.py` | 110 | OK |
+| `memory_test.py` | 42 | OK |
 | `verifier_test.py` | 27 | OK |
 | `live_refusal_probe_test.py` | 8 | OK |
-| **total** | **389** | **all passing** |
+| **total** | **442** | **all passing** |
 
 Counts are per module, each run on its own (`python3 <module>.py`); the combined
 `python3 -m unittest discover -p "*_test.py"` runs the same set. Numbers here are
 measured, and were stale once already — a count in a document is a claim like any
 other.
 
-Two instruments sit beside the tests and are not part of that count:
+These instruments sit beside the tests and are not part of that count:
 
 | instrument | what it measures |
 | --- | --- |
-| `loop_audit.py` | A/B on 11 detection pathologies (guard OFF vs ON) + 18 goal pathologies + the reflex-vs-verified false-success comparison + `--verifier` (6 claims, an honest and a lying control) + per-rule arms so a rule change is revertible from config. Ground truth is computed from **each pathology's own goal condition** read out of its plan — the input, never the loop's report. `audit_ok` requires the verifier's verdict to be `useful`, so a verifier that detects nothing turns the audit red |
-| `autonomy_suite.py` | 20 scored tasks with per-task budgets and 8 pre-registered floors; `--repeat N` requires identical verdicts across runs; `--register` / `--register-live` / `--register-immaculate` / `--register-verifier` write closed self-building cycles, each with its measured evidence block |
+| `loop_audit.py` | A/B on 11 detection pathologies (guard OFF vs ON) + 18 goal pathologies + the reflex-vs-verified false-success comparison + `--verifier` (6 claims, an honest and a lying control) + `--memory` (one two-run task, four cases: no history / a confirmed fact with recall off and on / the same value never confirmed) + per-rule arms so a rule change is revertible from config. Ground truth is computed from **each pathology's own goal condition** read out of its plan — the input, never the loop's report. `audit_ok` requires the verifier's and the memory arm's verdicts to be `useful`, so a verifier that detects nothing, or recall that changes no outcome, turns the audit red |
+| `autonomy_suite.py` | 20 scored tasks with per-task budgets and 8 pre-registered floors; `--repeat N` requires identical verdicts across runs; `--register` / `--register-live` / `--register-immaculate` / `--register-verifier` / `--register-memory` write closed self-building cycles, each with its measured evidence block |
+| `evidence_hygiene.py` | whether the published Q1 evidence log is measurements or test artifacts — classifying a row only on **positively identified stub markers**, never on "an endpoint I don't recognise", so a new real backend is not quarantined by a tool that has not heard of it |
 | `verifier_test.py` | the verifier's own two controls, plus the rule that a pass-through verifier is reported `no_verifier` rather than as a pass |
 | `live_refusal_probe.py` | the refusal path against a **real model** over the real cascade: it drives `autonomy.run_goal_verified` exactly as production does, records the transcript verbatim, and classifies the model's reply to the rejection note (including `replan_unlabelled`, the repair the loop used to discard). The only instrument here that spends requests, so nothing else ever runs it |

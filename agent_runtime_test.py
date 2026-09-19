@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_runtime
 import brain_cascade
+import loop_guard
 
 # The default residence is relative to the cwd, so without this a suite run from
 # the repo root appends its stub records to the PUBLISHED evidence log. See
@@ -601,6 +602,58 @@ class QihResidenceTest(unittest.TestCase):
         env = {"DRIVE_RESIDENCE": "freebrain-residence", "QIH_RESIDENCE": "qih-residence"}
         self.assertEqual(os.path.basename(agent_runtime.residence_path(env)), "freebrain-residence")
         self.assertEqual(os.path.basename(agent_runtime.qih_residence(env)), "qih-residence")
+
+
+class ReflexEvidenceGateTest(unittest.TestCase):
+    """The reflex loop's evidence writes follow the same flag as the guard's.
+
+    Regression, measured 2026-09-19: `_emit_step` was called here
+    unconditionally, so the audit's reflex arm appended 5 stub rows per
+    `autonomy_test.py` run to the PUBLISHED Q1 evidence log — a test writing
+    fabricated measurements into the deliverable, which is the defect
+    `test_support.py` was built to stop, one layer lower down. 7,033 such rows
+    had accumulated in it; they now live in `evidence/test-artifacts.jsonl`.
+
+    The first test asserts the gate is shut for a library run; the second that the
+    gate is a gate, not a deletion — a fix that stopped recording real runs would
+    pass the first test on its own.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="reflex-evidence-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "evidence.jsonl")
+        self.saved = os.environ.get("EVIDENCE_FILE")
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("EVIDENCE_FILE", None)
+        else:
+            os.environ["EVIDENCE_FILE"] = self.saved
+
+    def _run(self, guard):
+        original = agent_runtime.chat_stream
+        agent_runtime.chat_stream = lambda *a, **k: {
+            "content": "FINAL: done", "elapsed": 0.5, "tokens": 8,
+            "early_stop": True, "provider": "stub", "model": "stub"}
+        try:
+            return run_goal(_config(), "goal", guard=guard)
+        finally:
+            agent_runtime.chat_stream = original
+
+    def test_a_library_run_writes_no_evidence(self):
+        os.environ["EVIDENCE_FILE"] = self.path
+        self._run(loop_guard.LoopGuard(3, emit=False))
+        self.assertFalse(
+            os.path.exists(self.path),
+            "a run that opted out of recording appended an evidence record")
+
+    def test_a_recorded_run_still_writes_evidence(self):
+        os.environ["EVIDENCE_FILE"] = self.path
+        self._run(loop_guard.LoopGuard(3, emit=True))
+        with open(self.path, "r", encoding="utf-8") as f:
+            kinds = [json.loads(ln)["kind"] for ln in f if ln.strip()]
+        self.assertEqual(kinds, ["final"])
 
 
 if __name__ == "__main__":

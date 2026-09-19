@@ -625,11 +625,14 @@ def register(m, results, agree, repeat, checks, kind="overhaul", extra=None):
     detect_arm = loop_audit.run_suite(True)
     verify_arm = loop_audit.run_verify_comparison()
     v = verify_arm["assessment"]
+    memory_arm = loop_audit.run_memory_comparison()
+    ma = memory_arm["assessment"]
     thresholds = loop_guard.active_thresholds()
     path = loop_guard.register_thresholds(thresholds, source="autonomy_suite.py")
 
     test_count = _test_count("autonomy_test.py", "loop_guard_test.py",
                              "verifier_test.py")
+    memory_tests = _test_count("memory_test.py")
     detail = {
         "suite_tasks": m["tasks"],
         "task_accuracy": "%d/%d" % (sum(1 for r in results if r["correct"]),
@@ -663,8 +666,25 @@ def register(m, results, agree, repeat, checks, kind="overhaul", extra=None):
         "hollow_promotions_after": sum(r["confirmed"] for r in verify_arm["on"]
                                        if r["kind"] == "lying"),
         "verify_mode": thresholds.get("verify_mode"),
+        # ── A2 (memory.py) ──────────────────────────────────────────────
+        # The four cases and the two independent measures of false recall, so a
+        # registered cycle cannot claim improvement without also claiming what
+        # the never-confirmed control did.
+        "memory_cold_case_reached_it": ma["cold_reached_it"],
+        "memory_recall_changed_outcome": ma["recall_changed_the_outcome"],
+        "memory_false_recall": ma["false_recall"],
+        "memory_values_checked_for_leakage": ma["values_checked_for_leakage"],
+        "memory_values_too_short_to_check": ma["values_too_short_to_check"],
+        "memory_adversarial_value_usable": ma["adversarial_value_usable"],
+        "memory_verdict": ma["verdict"],
+        "memory_store_levels_seeded_with_verifier_off":
+            memory_arm["declared_seed"]["stored_levels"],
+        "memory_store_levels_seeded_with_verifier_on":
+            memory_arm["confirmed_seed"]["stored_levels"],
+        "recall_enabled": thresholds.get("recall_enabled"),
         "floors": {k: {"dir": d, "bound": b} for k, (d, b) in FLOORS.items()},
         "tests": test_count,
+        "memory_tests": memory_tests,
     }
     record = {
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -696,6 +716,13 @@ def register(m, results, agree, repeat, checks, kind="overhaul", extra=None):
             "verify_honest": v["honest_opportunities"],
             "verify_verdict": v["verdict"],
             "hollow": verify_arm["hollow_total"],
+            "mem_tests": (memory_tests or 0) + (test_count or 0),
+            "mem_facts": memory_arm["confirmed_on"]["facts"],
+            "mem_false": ma["false_recall"],
+            "mem_checked": ma["values_checked_for_leakage"],
+            "mem_verdict": ma["verdict"],
+            "mem_declared_level": ("/".join(memory_arm["declared_seed"]["stored_levels"])
+                                   or "nothing"),
         }),
     }
     # The measurements are ALWAYS recorded, not only when a caller passes `extra`.
@@ -718,6 +745,7 @@ _TITLES = {
     "immaculate": "closing the recorded weaknesses (vacuous goals, budgets, dropped "
                   "replies)",
     "verifier": "A3: an adversarial verifier — independent confirmation before promotion",
+    "memory": "A2: episodic memory with provenance — recall that cannot launder a claim",
 }
 
 _CYCLE_ID = {
@@ -725,6 +753,7 @@ _CYCLE_ID = {
     "live": "live_run_hardening",
     "immaculate": "weakness_closure",
     "verifier": "adversarial_verifier",
+    "memory": "episodic_memory",
 }
 
 # Phase text is templated with named placeholders and filled in by `_phases`, so a
@@ -812,6 +841,69 @@ _PHASES = {
                     "`%(verify_verdict)s`) + autonomy_suite.py %(suite_ok)d/%(suite_n)d "
                     "with all %(floors)d floors + detection arm %(detect_ok)d/%(detect_n)d "
                     "and goal arm %(goal_ok)d/%(goal_n)d unchanged",
+            "register": "thresholds -> %(path)s",
+    },
+    "memory": {
+            "detect": "A2's absence was a measurement, not a matter of taste. The "
+                      "ledger was write-only — 32 records in "
+                      "freebrain-residence/ledger.jsonl that nothing read back — so "
+                      "every run began from zero knowledge even when an earlier run "
+                      "had already established the fact it needed. AGENT-INTEGRITY.md "
+                      "had also recorded the shape of the failure to avoid: "
+                      "cross-instance memory was untyped in practice (every "
+                      "`memorize()` call site wrote type `observation`), so the one "
+                      "bucket that should hold invariants — `memory.facts` — was "
+                      "never written by anyone at all",
+            "research": "two candidate levers: (1) recall by lexical overlap, "
+                        "stdlib-only, in the same spirit as rag_core.py — the binding "
+                        "constraint measured for retrieval was verification, not "
+                        "ranking, and AUTONOMY-UPGRADE §6 says not to add an embedding "
+                        "dependency without a measurement that says lexical is what is "
+                        "failing; (2) provenance first: make the level a property of "
+                        "the record's birth and make the renderer *structurally* unable "
+                        "to put a non-invariant in a fact position, rather than asking "
+                        "a prompt to be careful",
+            "design": "memory.py: the three levels taken verbatim from "
+                      "AGENT-INTEGRITY.md (invariant / observed / volatile), an "
+                      "append-only JSONL store, recall scored as the fraction of the "
+                      "goal's content words a record's own text covers, and a render "
+                      "whose split is structural — the facts section is built from "
+                      "`facts()` alone and `unverified()` is its exact complement, so "
+                      "no argument to `render` puts a claim above the header. A3 "
+                      "decides the level at birth: confirmed and reproduced -> "
+                      "`invariant`, real but not re-observed -> `observed`, the "
+                      "model's own expectation with the verifier off -> `volatile`. "
+                      "That last row is the boundary — without it, switching the "
+                      "verifier off would be a way to launder a claim into a "
+                      "remembered fact. `promote()` refuses a volatile record "
+                      "outright and refuses an unnamed check; `audit()` re-checks a "
+                      "rendered block against the records it claims to render and "
+                      "reports values too short to search for rather than counting "
+                      "them clean",
+            "implement": "autonomy.run_goal_verified gains `memory_store` (None by "
+                         "default, so every existing caller behaves identically): "
+                         "recall is read once at plan time into the *system* message, "
+                         "which compaction never touches; each independently "
+                         "confirmed step is written back at its verified level; and "
+                         "memory is kept out of the completion gate — a goal that "
+                         "would hold over recalled facts alone is refused with "
+                         "`recall_gap` in the diagnosis rather than promoted to this "
+                         "run's evidence. loop_guard registers 5 recall thresholds; "
+                         "loop_audit gains the arm (one task, four cases) and "
+                         "`audit_ok` now requires the memory verdict to be `useful`, "
+                         "so recall that changes no outcome fails the audit",
+            "test": "memory_test.py (%(mem_tests)s tests across memory_test, "
+                    "verifier_test, autonomy_test and loop_guard_test) + "
+                    "loop_audit.py: the same task refused with recall off and "
+                    "succeeded with it on (%(mem_facts)d fact offered; the planner "
+                    "named the file only when a fact was in front of it), the "
+                    "never-confirmed value seeded with the verifier off stored as "
+                    "`%(mem_declared_level)s` and stayed unusable, false recall "
+                    "%(mem_false)d with %(mem_checked)d value(s) actually checked for "
+                    "leakage (verdict `%(mem_verdict)s`) + autonomy_suite.py "
+                    "%(suite_ok)d/%(suite_n)d with all %(floors)d floors + detection "
+                    "arm %(detect_ok)d/%(detect_n)d and goal arm %(goal_ok)d/"
+                    "%(goal_n)d unchanged",
             "register": "thresholds -> %(path)s",
     },
     "immaculate": {
@@ -920,6 +1012,9 @@ def main(argv=None):
     p.add_argument("--register-verifier", action="store_true",
                    help="...for A3, the adversarial verifier (independent confirmation "
                         "before promotion)")
+    p.add_argument("--register-memory", action="store_true",
+                   help="...for A2, episodic memory with provenance (recall that cannot "
+                        "launder a never-confirmed value into a fact)")
     p.add_argument("--repeat", type=int, default=2,
                    help="run the suite this many times and require identical verdicts "
                         "(the upgrade doc's 'run twice' rule; default 2)")
@@ -962,10 +1057,11 @@ def main(argv=None):
                   % (args.repeat, "identical verdicts"
                      if agree else "**VERDICTS DIFFER**"))
         if (args.register or args.register_live or args.register_immaculate
-                or args.register_verifier):
+                or args.register_verifier or args.register_memory):
             kind = ("live" if args.register_live else
                     "immaculate" if args.register_immaculate else
-                    "verifier" if args.register_verifier else "overhaul")
+                    "verifier" if args.register_verifier else
+                    "memory" if args.register_memory else "overhaul")
             path = register(m, results, agree, max(1, args.repeat), checks, kind=kind)
             print("\nregistered thresholds -> %s" % path)
             print("logged closed cycle -> %s" % loop_guard.SELF_IMPROVEMENT_LOG)

@@ -21,6 +21,8 @@ off, and nothing reaches the network. Three classes of test carry the weight:
 Run: python3 autonomy_test.py
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -36,7 +38,16 @@ import autonomy
 import autonomy_suite
 import loop_guard
 import loop_audit
+import memory
+import test_support
 import verifier
+
+# The documented rule for every suite: the *default* home is never the shipped
+# residence. This module read as safe because it builds its guards with
+# `emit=False`, but the reflex loop it exercises through the audit arms used to
+# write evidence regardless of that flag — so an audit test appended stub rows to
+# the published Q1 log. The loop is gated now; this is the belt to that braces.
+test_support.isolate_residence()
 
 ABSENT = "zzz-no-such-token"
 
@@ -675,6 +686,38 @@ class CliWiringTest(_FixtureCase):
         self.assertTrue(os.path.exists(self.env["LOOP_GUARD_LEDGER"]),
                         "a CLI run must record its faults")
 
+    def test_memory_is_opt_in_and_records_at_its_verified_level(self):
+        store = os.path.join(self.dir, "memory.jsonl")
+        # No flag: no store is created anywhere, which is the pre-A2 behaviour.
+        self._run_main(["--goal", "does the readme exist?"],
+                       [self.plan_ok(), _call("list_dir", self.root),
+                        "FINAL: yes it does"])
+        self.assertFalse(os.path.exists(store))
+
+        code = self._run_main(["--goal", "does the readme exist?", "--memory", store],
+                              [self.plan_ok(), _call("list_dir", self.root),
+                               "FINAL: yes it does"])
+        self.assertEqual(code, 0)
+        recs = memory.MemoryStore(store).records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["level"], "invariant")
+
+    def test_a_later_cli_run_reads_the_history_and_says_what_it_used(self):
+        store = os.path.join(self.dir, "memory.jsonl")
+        self._run_main(["--goal", "does the readme exist?", "--memory", store],
+                       [self.plan_ok(), _call("list_dir", self.root),
+                        "FINAL: yes it does"])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self._run_main(["--goal", "does the readme exist?", "--memory", store],
+                                  [self.plan_ok(), _call("list_dir", self.root),
+                                   "FINAL: yes it does"])
+        self.assertEqual(code, 0)
+        line = err.getvalue()
+        self.assertIn("[memory]", line)
+        self.assertIn("1 record(s), 1 recalled", line)
+        self.assertIn("0 provenance violation(s)", line)
+
 
 # ── The adversarial verifier's effect on promotion (A3) ───────────────────────
 
@@ -1007,6 +1050,83 @@ class VerifierAuditTest(_FixtureCase):
         self.assertFalse(loop_audit.audit_ok(hardened, goals, silent),
                          "a verifier that passes everything must fail the audit")
         self.assertTrue(loop_audit.audit_ok(hardened, goals, cmp))
+
+
+class MemoryAuditTest(unittest.TestCase):
+    """A2's arm, tested as a measurement device rather than as a feature.
+
+    One comparison is computed for the class: it runs the real loop six times,
+    which is cheap but not free, and every test here reads the same measurement.
+    """
+
+    comparison = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.comparison = loop_audit.run_memory_comparison()
+
+    def test_recall_improves_the_task_and_an_empty_history_does_not(self):
+        c = self.comparison
+        self.assertFalse(c["confirmed_off"]["ok"], "recall off must not reach it")
+        self.assertTrue(c["confirmed_on"]["ok"], "recall on must reach it")
+        # The control for the measurement itself: if the task were solvable with
+        # no history at all, "recall improved it" would be measuring nothing.
+        self.assertFalse(c["cold"]["ok"])
+        self.assertEqual(c["assessment"]["verdict"], "useful")
+
+    def test_the_planner_only_knows_the_file_when_a_fact_was_offered(self):
+        c = self.comparison
+        self.assertEqual(c["confirmed_on"]["named_fact"], "notes.md")
+        self.assertEqual(c["confirmed_off"]["named_fact"], "")
+        self.assertEqual(c["cold"]["named_fact"], "")
+        # And the switch really was only the read: the store was there throughout.
+        self.assertEqual(c["confirmed_off"]["available"], 1)
+        self.assertTrue(c["confirmed_off"]["suppressed"])
+
+    def test_the_seed_levels_follow_the_verifier(self):
+        c = self.comparison
+        self.assertEqual(c["confirmed_seed"]["stored_levels"], ["invariant"])
+        self.assertEqual(c["declared_seed"]["stored_levels"], ["volatile"])
+        self.assertEqual(c["declared_seed"]["evidence_levels"].get("declared"), 1)
+
+    def test_a_never_confirmed_value_cannot_be_used_as_a_fact(self):
+        adv = self.comparison["declared_on"]
+        self.assertFalse(adv["ok"], "an unconfirmed value reached the goal")
+        self.assertEqual(adv["recalled"], 1, "it must be recalled, or this is vacuous")
+        self.assertEqual(adv["facts"], 0)
+        self.assertEqual(adv["unverified"], 1)
+        self.assertEqual(adv["named_fact"], "")
+        self.assertEqual(adv["violations"], [])
+        # And the value was actually searched for, not simply too short to check.
+        self.assertGreaterEqual(adv["checked"], 1)
+        self.assertEqual(self.comparison["assessment"]["false_recall"], 0)
+
+    def test_a_leak_makes_the_verdict_unsafe(self):
+        c = self.comparison
+        leaky = dict(c, declared_on=dict(
+            c["declared_on"],
+            violations=[{"kind": "unverified_value_in_facts", "level": "volatile"}]))
+        a = loop_audit.memory_assessment(leaky)
+        self.assertEqual(a["verdict"], "unsafe")
+        self.assertEqual(a["false_recall"], 1)
+
+    def test_recall_that_reaches_nothing_is_no_memory_not_a_pass(self):
+        c = self.comparison
+        useless = dict(c, confirmed_on=dict(c["confirmed_on"], ok=False))
+        self.assertEqual(loop_audit.memory_assessment(useless)["verdict"], "no_memory")
+
+    def test_the_audit_fails_when_memory_cannot_be_trusted_or_changes_nothing(self):
+        c = self.comparison
+        hardened = [{"correct": True}]
+        goals = [{"correct": True, "false_success": False}]
+        verify = loop_audit.run_verify_comparison()
+        self.assertTrue(loop_audit.audit_ok(hardened, goals, verify, c))
+        for bad in (dict(c, declared_on=dict(c["declared_on"], ok=True)),
+                    dict(c, confirmed_on=dict(c["confirmed_on"], ok=False))):
+            self.assertFalse(
+                loop_audit.audit_ok(hardened, goals, verify,
+                                    dict(bad, assessment=loop_audit.memory_assessment(bad))),
+                "memory that is unsafe, or that changes nothing, must fail the audit")
 
 
 # ── Instruments check themselves ──────────────────────────────────────────────

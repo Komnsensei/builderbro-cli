@@ -26,13 +26,17 @@ import argparse
 import datetime
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent_runtime
 import autonomy
 import loop_guard
+import memory
 import verifier
 
 
@@ -989,14 +993,282 @@ def report_verifier(comparison):
     return "\n".join(lines)
 
 
-def audit_ok(hardened, goals, verify):
+# ─────────────────────────────────────────────────────────────────────────────
+# A2's arm: episodic memory with provenance
+#
+# The only shape that can measure recall at all is two runs over one store: the
+# second run needs an outcome the first one produced, and neither run is allowed
+# to see the other's context. One task, four cases:
+#
+#   cold           no history at all                         -> must fail
+#   confirmed_off  a confirmed fact exists, recall switched off -> must fail
+#   confirmed_on   the same store, recall switched on           -> must succeed
+#   declared_on    the SAME VALUE, but it was never independently confirmed
+#                  (it was seeded with the verifier off)        -> must still fail
+#
+# `confirmed_off` vs `confirmed_on` is the improvement; `declared_on` is the
+# false-recall control. Without that last case a memory that presented every
+# remembered value as a fact would score a perfect improvement rate.
+#
+# The consumer is a deterministic stand-in for a model that reads its prompt: it
+# looks for a `*.md` name *above the unverified header* and can name the file only
+# if the loop put a fact in front of it. The arms therefore differ in exactly one
+# thing — what was rendered — which is what makes the difference attributable. The
+# limit is stated rather than implied: this measures the **channel** (a confirmed
+# fact reaches the planner, labelled; an unconfirmed value is unusable), not a
+# real model's willingness to use what it is given.
+
+MEMORY_MARKER = "episodic-marker"
+SEED_GOAL = "find which file in the workspace holds the marker"
+USE_GOAL = "read the file that holds the marker and report it"
+_FACT_FILE_RE = re.compile(r"\b([A-Za-z0-9_.\-]+\.md)\b")
+
+
+def _plan_block(steps, goal):
+    lines = ["PLAN:"]
+    for i, (tool, arg, expect) in enumerate(steps, 1):
+        lines.append("%d. tool: %s %s" % (i, tool, arg))
+        lines.append("   expect: %s" % expect)
+    lines.append("GOAL-CHECK: %s" % goal)
+    return "\n".join(lines)
+
+
+def _stub_reply(content):
+    return {"content": content, "elapsed": 0.01, "tokens": 8, "early_stop": True,
+            "provider": "stub", "model": "stub"}
+
+
+def _fact_filename(system_text):
+    """The first file name offered as a *fact* — above the unverified header.
+
+    Below the header the consumer may not look, deliberately: a value that is
+    present but labelled is useful only if the label changes what may be done
+    with it, and this is where that is enforced.
+    """
+    if "Known facts" not in (system_text or ""):
+        return ""
+    head = system_text.split(memory.UNVERIFIED_HEADER, 1)[0]
+    found = _FACT_FILE_RE.search(head)
+    return found.group(1) if found else ""
+
+
+def _context_reading_stub(root, recorder=None, guess="unknown-file.md"):
+    """A model whose only source of the file's name is the prompt it was given."""
+    calls = {"n": 0}
+
+    def chat(config, messages, temperature=None, max_tokens=None, timeout_s=None,
+             stop_when=None, **_kw):
+        if recorder is not None:
+            recorder.append([dict(m) for m in messages])
+        n = calls["n"]
+        calls["n"] += 1
+        system = (messages[0].get("content") or "") if messages else ""
+        name = _fact_filename(system) or guess
+        path = os.path.join(root, name)
+        if n == 0:
+            return _stub_reply(_plan_block([("read_file", path,
+                                             "contains:%s" % MEMORY_MARKER)],
+                                            "contains:%s" % MEMORY_MARKER))
+        if n == 1:
+            return _stub_reply("<<<TOOL:read_file %s>>>" % path)
+        return _stub_reply("FINAL: the marker file is %s" % name)
+
+    return chat
+
+
+def _memory_workspace():
+    root = tempfile.mkdtemp(prefix="loop-audit-memory-")
+    with open(os.path.join(root, "notes.md"), "w", encoding="utf-8") as f:
+        f.write("%s appears here\n" % MEMORY_MARKER)
+    return root
+
+
+def run_memory_seed(store, root, *, verify_mode="confirm", max_steps=6,
+                    thresholds=None):
+    """Run 1: a listing whose *outcome* run 2 will need, written to `store`.
+
+    Both levels are produced the same way — by running the real loop with the
+    verifier on or off — so the adversarial control's provenance is earned rather
+    than hand-made. `verify_mode: off` is the A1-only path, where the step is
+    promoted on the model's own declared expectation with no independent check.
+    """
+    t = dict(thresholds if thresholds is not None
+             else loop_guard.active_thresholds())
+    t["verify_mode"] = verify_mode
+    replies = [_plan_block([("list_dir", root, "contains:notes.md")],
+                           "contains:notes.md"),
+               "<<<TOOL:list_dir %s>>>" % root,
+               "FINAL: notes.md holds the marker"]
+    real_chat = agent_runtime.chat_stream
+    agent_runtime.chat_stream = _replies_stub(replies)
+    try:
+        res = autonomy.run_goal_verified(
+            None, SEED_GOAL,
+            guard=loop_guard.LoopGuard(max_steps, thresholds=t, emit=False),
+            max_tool_steps=max_steps, thresholds=t, emit=False,
+            memory_store=store)
+    finally:
+        agent_runtime.chat_stream = real_chat
+    records = memory.open_store(store).records()
+    return {"ok": bool(res["ok"]), "reason": res["reason"],
+            "evidence_levels": dict(res["evidence_levels"]),
+            "written": res["recall"]["written"],
+            "stored_levels": [r.get("level") for r in records]}
+
+
+def run_memory_use(store, root, *, recall=1, max_steps=6, thresholds=None):
+    """Run 2: the same task with and without the history, measured the same way."""
+    t = dict(thresholds if thresholds is not None
+             else loop_guard.active_thresholds())
+    t["recall_enabled"] = recall
+    batches = []
+    real_chat = agent_runtime.chat_stream
+    agent_runtime.chat_stream = _context_reading_stub(root, recorder=batches)
+    try:
+        res = autonomy.run_goal_verified(
+            None, USE_GOAL,
+            guard=loop_guard.LoopGuard(max_steps, thresholds=t, emit=False),
+            max_tool_steps=max_steps, thresholds=t, emit=False,
+            memory_store=store)
+    finally:
+        agent_runtime.chat_stream = real_chat
+    r = res["recall"]
+    system = (batches[0][0].get("content") or "") if batches else ""
+    return {"recall": recall, "ok": bool(res["ok"]), "reason": res["reason"],
+            "recalled": r["recalled"], "facts": r["facts"],
+            "unverified": r["unverified"], "available": r["available"],
+            "suppressed": r["suppressed"],
+            "violations": r["violations"], "checked": r["checked"],
+            "unchecked": r["unchecked"],
+            "named_fact": _fact_filename(system),
+            "verified_steps": res["verified_steps"],
+            "recall_gap": bool((res.get("diagnosis") or {}).get("detail", {})
+                               .get("recall_gap"))}
+
+
+def run_memory_comparison(max_steps=6, thresholds=None):
+    """A2's exit criteria, measured: improvement with recall ON vs OFF on the same
+    task, and a value that was never independently confirmed left unusable."""
+    root = _memory_workspace()
+    tmp = tempfile.mkdtemp(prefix="loop-audit-memory-store-")
+    try:
+        # One store per case: the cases must not read each other's records, or
+        # "no history" and "a claim of history" would be the same input.
+        confirmed = os.path.join(tmp, "confirmed.jsonl")
+        declared = os.path.join(tmp, "declared.jsonl")
+        cold_store = os.path.join(tmp, "cold.jsonl")
+        out = {
+            "cold": run_memory_use(cold_store, root, recall=1,
+                                   max_steps=max_steps, thresholds=thresholds),
+            "confirmed_seed": run_memory_seed(confirmed, root, verify_mode="confirm",
+                                              max_steps=max_steps,
+                                              thresholds=thresholds),
+            "declared_seed": run_memory_seed(declared, root, verify_mode="off",
+                                             max_steps=max_steps, thresholds=thresholds),
+        }
+        out["confirmed_off"] = run_memory_use(confirmed, root, recall=0,
+                                              max_steps=max_steps,
+                                              thresholds=thresholds)
+        out["confirmed_on"] = run_memory_use(confirmed, root, recall=1,
+                                             max_steps=max_steps,
+                                             thresholds=thresholds)
+        out["declared_on"] = run_memory_use(declared, root, recall=1,
+                                            max_steps=max_steps,
+                                            thresholds=thresholds)
+        out["assessment"] = memory_assessment(out)
+        return out
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def memory_assessment(comparison):
+    """A2's verdict, computed from the four cases rather than asserted.
+
+    The meta-rule matches A3's: recall that changes nothing is reported as
+    `no_memory` rather than as a pass, and a single false recall (a remembered
+    value presented as a fact, or a never-confirmed value that was usable anyway)
+    is `unsafe` — the failure A2 would be worse than useless for.
+    """
+    rows = [comparison[k] for k in ("cold", "confirmed_off", "confirmed_on",
+                                    "declared_on")]
+    violations = sum(len(r["violations"]) for r in rows)
+    improved = bool(comparison["confirmed_on"]["ok"]
+                    and not comparison["confirmed_off"]["ok"])
+    adversarial_usable = bool(comparison["declared_on"]["ok"])
+    verdict = ("unsafe" if (violations or adversarial_usable)
+               else "useful" if improved else "no_memory")
+    return {
+        "improved": improved,
+        "cold_reached_it": bool(comparison["cold"]["ok"]),
+        "recall_changed_the_outcome": bool(
+            comparison["confirmed_on"]["ok"] != comparison["confirmed_off"]["ok"]),
+        "adversarial_value_usable": adversarial_usable,
+        "false_recall": violations,
+        "values_checked_for_leakage": sum(r["checked"] for r in rows),
+        "values_too_short_to_check": sum(r["unchecked"] for r in rows),
+        "verdict": verdict,
+    }
+
+
+def report_memory(comparison):
+    a = comparison["assessment"]
+    seed = comparison["confirmed_seed"]
+    seed_off = comparison["declared_seed"]
+    lines = ["", "Episodic memory audit (A2) — one task, two runs, four cases:", "",
+             "| case | history | recall | recalled | facts | named the file | "
+             "outcome |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    labels = [("cold", "none (empty store)", "on"),
+              ("confirmed_off", "1 confirmed fact", "off"),
+              ("confirmed_on", "1 confirmed fact", "on"),
+              ("declared_on", "1 never-confirmed value", "on")]
+    for key, hist, rec in labels:
+        r = comparison[key]
+        lines.append("| `%s` | %s | %s | %d | %d | %s | %s |"
+                     % (key, hist, rec, r["recalled"], r["facts"],
+                        "`%s`" % r["named_fact"] if r["named_fact"] else "—",
+                        "**succeeded**" if r["ok"] else "refused (`%s`)" % r["reason"]))
+    lines.append("")
+    lines.append("**Seed runs:** verifier on -> step confirmed at `%s`, stored as `%s`; "
+                 "verifier off -> promoted at `%s`, stored as `%s`."
+                 % (seed["evidence_levels"].get("invariant", 0) and "invariant" or "—",
+                    "/".join(seed["stored_levels"]) or "nothing",
+                    seed_off["evidence_levels"].get("declared", 0) and "declared" or "—",
+                    "/".join(seed_off["stored_levels"]) or "nothing"))
+    lines.append("**Improvement:** recall ON %s vs OFF %s on the same task; with no "
+                 "history at all the task %s."
+                 % ("succeeded" if comparison["confirmed_on"]["ok"] else "failed",
+                    "succeeded" if comparison["confirmed_off"]["ok"] else "failed",
+                    "still succeeded (the measurement is void)"
+                    if a["cold_reached_it"] else "failed, as it must"))
+    lines.append("**False recall:** %d violation(s) across the rendered blocks "
+                 "(%d value(s) checked for leakage, %d too short to check). The "
+                 "never-confirmed value was %s."
+                 % (a["false_recall"], a["values_checked_for_leakage"],
+                    a["values_too_short_to_check"],
+                    "usable as a fact — UNSAFE" if a["adversarial_value_usable"]
+                    else "offered below the unverified header and unusable"))
+    lines.append("**Verdict:** `%s`%s."
+                 % (a["verdict"],
+                    "" if a["verdict"] == "useful" else
+                    " — recall that presents an unconfirmed value as a fact is worse "
+                    "than no recall at all" if a["verdict"] == "unsafe" else
+                    " — memory that changes no outcome is a cost, not a capability"))
+    return "\n".join(lines)
+
+
+def audit_ok(hardened, goals, verify, memory_cmp=None):
     """The audit's exit criteria in ONE place, so a red audit cannot be mistaken
     for a green one. A3's rule is deliberately part of it: a verifier that detects
-    nothing makes the audit fail, rather than being reported as a pass."""
+    nothing makes the audit fail, rather than being reported as a pass. A2's is the
+    same shape — recall that changes nothing, or that leaks an unconfirmed value
+    into a fact position, fails the audit."""
     return (sum(1 for r in hardened if r["correct"]) == len(hardened)
             and all(r["correct"] for r in goals)
             and not any(r["false_success"] for r in goals)
-            and verify["assessment"]["useful"])
+            and verify["assessment"]["useful"]
+            and (memory_cmp is None
+                 or memory_cmp["assessment"]["verdict"] == "useful"))
 
 
 def main(argv=None):
@@ -1012,6 +1284,10 @@ def main(argv=None):
                    help="also audit the adversarial verifier (A3): whether a "
                         "promoted step was independently confirmed, measured "
                         "against an honest and a lying control")
+    p.add_argument("--memory", action="store_true",
+                   help="also audit episodic memory (A2): whether a confirmed fact "
+                        "reaches the planner, and whether a value that was never "
+                        "independently confirmed stays unusable")
     args = p.parse_args(argv)
 
     thresholds = loop_guard.active_thresholds()
@@ -1021,6 +1297,7 @@ def main(argv=None):
     goals = run_autonomy_suite(thresholds=thresholds)
     false_success = run_false_success_comparison(thresholds=thresholds)
     verify = run_verify_comparison(thresholds=thresholds)
+    memory_cmp = run_memory_comparison(thresholds=thresholds)
 
     if args.register:
         path = loop_guard.register_thresholds(thresholds, source="loop_audit.py")
@@ -1088,7 +1365,7 @@ def main(argv=None):
         print(json.dumps({"baseline": baseline, "hardened": hardened,
                           "repeat_modes": by_mode, "goals": goals,
                           "false_success_comparison": false_success,
-                          "verifier": verify,
+                          "verifier": verify, "memory": memory_cmp,
                           "thresholds": thresholds}, indent=1, sort_keys=True))
     else:
         print(report(baseline, hardened))
@@ -1098,7 +1375,9 @@ def main(argv=None):
             print(report_false_success(false_success))
         if args.verifier:
             print(report_verifier(verify))
-    return 0 if audit_ok(hardened, goals, verify) else 1
+        if args.memory:
+            print(report_memory(memory_cmp))
+    return 0 if audit_ok(hardened, goals, verify, memory_cmp) else 1
 
 
 if __name__ == "__main__":
