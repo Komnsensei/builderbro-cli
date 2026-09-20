@@ -19,10 +19,14 @@ evidence hygiene classifier (`evidence_hygiene.py`) and grounded retrieval
     BuilderBro                  ->  refuses unverified claims, remembers with
                                     provenance, audits what was recorded
 
-Freebuff is that agent. `mcp.json` in this repo registers this server with it —
-`freebuff --trust-agents` loads a repository's `.agents` files and `mcp.json`,
-and the installed core reads `mcpServers[name].command` / `.args` / `.env` and
-namespaces the loaded tools as `name__tool`.
+Freebuff is that agent. `.agents/mcp.json` in this repo registers this server
+with it — `freebuff --trust-agents` walks `<cwd>/.agents`, `<cwd>/../.agents`
+and `~/.agents`, opens `mcp.json` in each, and reads
+`mcpServers[name].command` / `.args` / `.env`, namespacing the loaded tools as
+`name__tool`. The file has to sit in one of those three directories and use only
+those keys: the loader opens nothing at the repository root, and its entry schema
+is strict, so a misplaced or over-decorated file is skipped in silence
+(`RegistryTest` in the test module asserts exactly that).
 
 WHAT THIS SERVER DELIBERATELY DOES NOT DO
 -----------------------------------------

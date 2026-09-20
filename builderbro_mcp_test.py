@@ -24,6 +24,13 @@ goes wrong, none of which is "the JSON is malformed":
    transport's `isError`. A refusal that arrived as an error would invite a caller
    to retry a check that had already ruled. Asserted in both directions.
 
+4. **It sits somewhere nothing reads.** Registering the server is not "the JSON
+   is valid": the loader only opens `mcp.json` from a `.agents` directory, and a
+   stdio entry is a *strict* schema, so a misplacement or one extra key disables
+   the whole surface **in silence** — no error, no tools, a loop quietly less
+   capable than the repository claims. `RegistryTest` asserts placement, key set,
+   transport and env against the loader's own code.
+
 Run: python3 builderbro_mcp_test.py
 """
 
@@ -43,6 +50,13 @@ import memory
 import test_support
 
 test_support.isolate_residence()
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Where Freebuff's loader opens this repository's registry: it walks
+# `<cwd>/.agents`, `<cwd>/../.agents` and `~/.agents` and reads `mcp.json` in
+# each. A copy at the repository root is never opened (see `RegistryTest`).
+REGISTRY = os.path.join(HERE, ".agents", "mcp.json")
 
 
 class _Temp(unittest.TestCase):
@@ -469,23 +483,102 @@ class CliTest(_Temp):
         self.assertEqual(json.loads(text)["error"], "bad_request")
 
     def test_the_registered_command_line_can_actually_start_the_server(self):
-        # The registry names `python3 builderbro_mcp.py`; if that ever stops being
-        # a working server, mcp.json is a file that only looks correct.
-        spec = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                          "mcp.json"), encoding="utf-8"))
-        entry = spec["mcpServers"]["builderbro"]
+        # The registry names `python3 builderbro_mcp.py`. Spawning it the way the
+        # loader does — inherited cwd, no `cwd` argument, newline-delimited
+        # framing — is what keeps `.agents/mcp.json` from being a file that only
+        # looks correct. (`RegistryTest` covers the shape it must have to be read
+        # at all.)
+        with open(REGISTRY, encoding="utf-8") as handle:
+            entry = json.load(handle)["mcpServers"]["builderbro"]
         self.assertIn(entry["command"], ("python3", "python"))
         self.assertTrue(entry["args"])
-        self.assertIsInstance(entry.get("env", {}), dict)
 
         import subprocess
-        here = os.path.dirname(os.path.abspath(__file__))
-        proc = subprocess.run([entry["command"]] + entry["args"],
-                              cwd=here, input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
-                              capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(
+            [entry["command"]] + entry["args"], cwd=HERE,
+            input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
+                  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n',
+            capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr[-500:])
-        reply = json.loads(proc.stdout.splitlines()[0])
-        self.assertEqual(reply["result"]["serverInfo"]["name"], "builderbro")
+        replies = [json.loads(line) for line in proc.stdout.splitlines()]
+        self.assertEqual(replies[0]["result"]["serverInfo"]["name"], "builderbro")
+        names = [tool["name"] for tool in replies[1]["result"]["tools"]]
+        self.assertEqual(sorted(names), sorted(mcp.TOOLS))
+        for name in names:
+            self.assertNotIn("__", name, "the loader prefixes the server name with `__`")
+
+
+# ── 9. The registry, against the loader's own contract ───────────────────────
+
+class RegistryTest(_Temp):
+    """The four ways this file can be ignored, all of them silent.
+
+    Read out of the installed Freebuff binary (`~/.config/manicode/freebuff`),
+    not out of documentation. Its loader walks `[<cwd>/.agents, <cwd>/../.agents,
+    ~/.agents]`, opens `mcp.json` in each, and `continue`s past every path that
+    is missing, unparseable, or fails the schema — so each failure below costs
+    the loop its tools and reports nothing. This repository had the first one:
+    the registry sat at the repository root, where the loader never looks.
+    """
+
+    # The loader's `KJT`: `z.strictObject` with exactly these four keys (`type`
+    # defaults to "stdio", `args` to `[]`, `env` to `{}`). `cwd` is *not* among
+    # them even though the spawn would honour it, so a relative command resolves
+    # against the client's process cwd and cannot be pinned here.
+    STDIO_KEYS = {"type", "command", "args", "env"}
+
+    def entries(self):
+        with open(REGISTRY, encoding="utf-8") as handle:
+            return json.load(handle)["mcpServers"]
+
+    def test_the_registry_sits_where_the_loader_actually_looks(self):
+        self.assertTrue(os.path.isfile(REGISTRY),
+                        "the loader only opens mcp.json inside a `.agents` directory")
+        self.assertFalse(os.path.exists(os.path.join(HERE, "mcp.json")),
+                         "a repository-root mcp.json is never read, and a decoy "
+                         "here is worse than nothing: it looks like the registry")
+
+    def test_the_registry_declares_at_least_one_server(self):
+        self.assertTrue(self.entries(), "an empty mcpServers loads nothing")
+        self.assertIn("builderbro", self.entries())
+
+    def test_every_entry_uses_only_keys_the_loader_schema_allows(self):
+        # strictObject means one unknown key fails safeParse for the *whole
+        # file*: adding `cwd` here would unregister every server at once.
+        for name, entry in self.entries().items():
+            with self.subTest(server=name):
+                self.assertEqual(set(entry) - self.STDIO_KEYS, set(),
+                                 "the loader rejects unknown keys, and a rejected "
+                                 "entry takes the whole file with it")
+                self.assertIsInstance(entry["command"], str)
+                self.assertTrue(entry["command"].strip())
+                self.assertIsInstance(entry.get("args", []), list)
+                for arg in entry.get("args", []):
+                    self.assertIsInstance(arg, str)
+                self.assertIsInstance(entry.get("env", {}), dict)
+
+    def test_the_transport_is_the_one_the_loader_defaults_to(self):
+        for name, entry in self.entries().items():
+            with self.subTest(server=name):
+                self.assertEqual(entry.get("type", "stdio"), "stdio")
+
+    def test_no_env_value_defers_to_an_undefined_variable(self):
+        # The loader resolves a `"$NAME"` env value from its own process and
+        # throws `Missing environment variable '<NAME>' required by MCP server
+        # '<name>' in mcp.json` — which skips the file, like every other fault.
+        for name, entry in self.entries().items():
+            for key, value in (entry.get("env") or {}).items():
+                with self.subTest(server=name, key=key):
+                    self.assertIsInstance(value, str)
+                    if value.startswith("$"):
+                        self.assertIn(value[1:], os.environ)
+
+    def test_every_server_name_namespaces_unambiguously(self):
+        # Tools register as `<server>__<tool>`, split on a literal "__".
+        for name in self.entries():
+            with self.subTest(server=name):
+                self.assertNotIn("__", name)
+                self.assertEqual(name, name.strip())
 
 
 if __name__ == "__main__":

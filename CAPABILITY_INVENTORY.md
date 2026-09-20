@@ -802,8 +802,8 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 | --- | --- |
 | status | verified |
 | implementation | `builderbro_mcp.py` — a stdio MCP server exposing the verification stack as five tools: `verify_claim` (A3), `memory_recall` / `memory_record` (A2), `rag_ask` (the `builderbro-rag` skill), `evidence_audit` (`evidence_hygiene`). JSON-RPC 2.0, newline-delimited, stdlib only, no network of its own |
-| entry points | `mcp.json` registers it with Freebuff, which loads a repository's `.agents` files and `mcp.json` (`--trust-agents`) and namespaces loaded tools `builderbro__<tool>`. Also a shell CLI: `--tools`, `--call NAME --json '{...}'`, or serve on stdio |
-| tests | `builderbro_mcp_test.py` (45), one of which spawns the server exactly as `mcp.json` names it and completes a live `initialize` handshake — so the registry file cannot rot into something that only looks correct |
+| entry points | `.agents/mcp.json` registers it. Freebuff's loader walks `<cwd>/.agents`, `<cwd>/../.agents` and `~/.agents`, opens `mcp.json` in each, and namespaces loaded tools `builderbro__<tool>`; it reads **nothing at the repository root**, and the entry schema is a `strictObject` (`type` / `command` / `args` / `env` only, so `cwd` is not settable). `RegistryTest` asserts both. Also a shell CLI: `--tools`, `--call NAME --json '{...}'`, or serve on stdio |
+| tests | `builderbro_mcp_test.py` (51). One spawns the server exactly as `.agents/mcp.json` names it and completes a live `initialize` + `tools/list` handshake; six more (`RegistryTest`) assert placement, key set, transport, env and namespacing against the loader's own code — each with its negative control run, so the registry cannot rot into a file that only looks correct |
 | reproduction | `python3 builderbro_mcp_test.py`; `python3 builderbro_mcp.py --tools`; `python3 builderbro_mcp.py --call verify_claim --json '{"tool":"read_file","arg":"memory.py","output":"<file>","expect":"contains:class MemoryStore"}'` |
 
 ### Why it exists — the planner was the weak link, not the checking
@@ -876,22 +876,45 @@ framing — then a full session was driven through it:
 | `evidence_audit` on the real Q1 log | 1780 rows, **1780 measurements, 0 artifacts** |
 | `rag_ask` (offline extractive) | answered with citations `[1, 2, 5]`, 0.79s |
 
+### The live check — where it stands, measured
+
+`.agents/mcp.json` was at the repository root until this cycle, where the loader
+never looks. That is the defect the live probe was built to catch, and getting the
+probe itself honest took four attempts, each exposing a harness fault the previous
+one hid:
+
+| attempt | what it actually showed |
+| --- | --- |
+| 1 | `loaded` — on 270 bytes that were the probe's own prompt echoed back by the pty. The prompt names the tool, so the search matched the probe's words. Fixed by removing the prompt echo before classifying |
+| 2 | zero bytes for 4.5 min: the client blocked on a kitty keyboard query no bare pty answers. Fixed with `QUERY_RESPONSES` |
+| 3 | painted at 10.9s, then stopped: five DECRQM queries unanswered (`?1004$p ?1016$p ?2004$p ?2027$p ?2031$p`). Fixed by declining every `CSI ? Ps $ p` |
+| 4 | painted a full frame at 12.3s — 15,429 rendered bytes, `unanswered_queries: []` — and never left a loading animation |
+
+So the probe reaches the client and does not yet reach a verdict on it. Verdict
+`inconclusive`, and it says which of the two inconclusive reasons it hit; the probe
+reports what it saw rather than what it hoped for.
+
 ### Known weaknesses — do not paper over these
 
 - **The re-observation is caller-attested, and cannot be otherwise here.** The
   channel gives a caller that wants to lie exactly one place to do it. What is
   prevented is the *accidental* case (an expectation that does not hold, or a
   sample that does not reproduce) and the *unlabelled* case.
-- **Tested against a client written here, not against Freebuff itself.** The
-  registry's shape (`mcpServers[name].command` / `.args` / `.env`, tools
-  namespaced `server__tool`) was read out of the installed Freebuff binary's own
-  loader, and the server was then driven over exactly that contract. That is
-  strong evidence and it is not the same as a real session loading it — that
-  check needs a Freebuff session started in this repository.
-- **A relative path in `mcp.json`, resolved against the client's cwd.** The
-  loader spawns with `{env, stdio}` and no `cwd`, so `python3 builderbro_mcp.py`
-  resolves relative to wherever Freebuff was started. Launch it in the repo root,
-  or the failure is a warning log and no tools for that step.
+- **A live session boots, and no verdict has been read off one yet.**
+  `live_mcp_probe.py` now starts a real `freebuff --trust-agents` on a pty, gets
+  it painting (12.3s to first byte, every terminal query answered and what could
+  not be answered recorded), and the client then stays in a loading animation and
+  never lists a tool. That is why the verdict is `inconclusive`. The likeliest
+  cause is environmental and named: a session already owns this project
+  (`freebuff-instance-owner.json` names the session these runs were made from), so
+  the check to run is `python3 live_mcp_probe.py` with **no other Freebuff session
+  open**, or asking a session in this repository to call `builderbro__verify_claim`
+  directly.
+- **The spawn command is relative and cannot be pinned.** `cwd` is not an allowed
+  key in the loader's `strictObject`, so `python3 builderbro_mcp.py` resolves
+  against the client's process cwd, and discovery is rooted at that same cwd.
+  Launch Freebuff in the repository root: the loader only walks `.agents`
+  directories under the cwd, its parent, and `$HOME`.
 - **This changes no ceiling.** The tools are read-only plus the memory store — no
   execution, no file writes, no sandbox. Self-building is still impossible, and
   this surface does not make it possible; it makes the *verification* usable by
@@ -916,8 +939,9 @@ framing — then a full session was driven through it:
 | `memory_test.py` | 42 | OK |
 | `verifier_test.py` | 27 | OK |
 | `live_refusal_probe_test.py` | 8 | OK |
-| `builderbro_mcp_test.py` | 45 | OK |
-| **total** | **517** | **all passing** |
+| `builderbro_mcp_test.py` | 51 | OK |
+| `live_mcp_probe_test.py` | 28 | OK |
+| **total** | **551** | **all passing** |
 
 Counts are per module, each run on its own (`python3 <module>.py`); the combined
 `python3 -m unittest discover -p "*_test.py"` runs the same set. Numbers here are
@@ -933,3 +957,4 @@ These instruments sit beside the tests and are not part of that count:
 | `evidence_hygiene.py` | whether the published Q1 evidence log is measurements or test artifacts — classifying a row only on **positively identified stub markers**, never on "an endpoint I don't recognise", so a new real backend is not quarantined by a tool that has not heard of it |
 | `verifier_test.py` | the verifier's own two controls, plus the rule that a pass-through verifier is reported `no_verifier` rather than as a pass |
 | `live_refusal_probe.py` | the refusal path and **unseeded execution** against a **real model** over the real cascade: it drives `autonomy.run_goal_verified` exactly as production does, records the transcript verbatim, and classifies the model's reply to the rejection note (including `replan_unlabelled`, the repair the loop used to discard). `--report <summary>` reprints and `--register --cycle {refusal,unseeded}` closes either cycle **without spending requests again**, which is why a saved summary exists. The only instrument here that spends requests, so nothing else ever runs it |
+| `live_mcp_probe.py` | whether a **real Freebuff session** loads `.agents/mcp.json`: it starts `freebuff --trust-agents` on a pty, answers the terminal queries a TUI blocks on, types one read-only prompt that requires the tool, and classifies the transcript `loaded` / `rejected` / `inconclusive` — removing its own prompt echo first, because a pty echoes input and the naive search matched the probe's own words (it reported `loaded` on 270 bytes of itself). `--classify FILE` re-scores a saved transcript |
