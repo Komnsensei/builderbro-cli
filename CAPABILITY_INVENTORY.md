@@ -9,8 +9,9 @@ command that has been run and a number that came out of it. A capability with a
 mechanism but no measurement is `unmeasured`. Aspirational entries are
 `planned` and must not be depended on.
 
-Last updated: 2026-09-19 (A2: episodic memory with provenance, its audit arm, and
-the evidence-leak cycle that verifying it turned up; 443 tests)
+Last updated: 2026-09-20 (the verification stack exposed over MCP so an external
+agent can call it, and a diverged working tree reconciled against the last
+commit; 517 tests)
 
 See also: **`AUTONOMY-UPGRADE.md`** — a measured assessment of what autonomy still
 lacks and the dependency-ordered plan to add it. Written 2026-09-16 as a proposal;
@@ -19,8 +20,13 @@ Everything there beyond A3 is still `planned` and must not be depended on.
 
 Test suites (the reproduction command for every count below):
 `python3 -m unittest agent_runtime_test autonomy_test brain_cascade_test drift_loop_test loop_guard_test qih_metrics_test`
-→ 331 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
-plus `verifier_test` 27 and `live_refusal_probe_test` 8. **463 total, all pass.**
+→ 340 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
+plus `verifier_test` 27, `live_refusal_probe_test` 8 and `builderbro_mcp_test` 45.
+**517 total, all pass.**
+
+The counts in this file are also the claim most likely to go stale, and they had
+(443 → 517 was four modules' worth of tests the header had not been told about).
+They are re-measured, not carried forward.
 
 ---
 
@@ -790,21 +796,128 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 
 ---
 
+## Verification surface over MCP — `verified`
+
+| field | value |
+| --- | --- |
+| status | verified |
+| implementation | `builderbro_mcp.py` — a stdio MCP server exposing the verification stack as five tools: `verify_claim` (A3), `memory_recall` / `memory_record` (A2), `rag_ask` (the `builderbro-rag` skill), `evidence_audit` (`evidence_hygiene`). JSON-RPC 2.0, newline-delimited, stdlib only, no network of its own |
+| entry points | `mcp.json` registers it with Freebuff, which loads a repository's `.agents` files and `mcp.json` (`--trust-agents`) and namespaces loaded tools `builderbro__<tool>`. Also a shell CLI: `--tools`, `--call NAME --json '{...}'`, or serve on stdio |
+| tests | `builderbro_mcp_test.py` (45), one of which spawns the server exactly as `mcp.json` names it and completes a live `initialize` handshake — so the registry file cannot rot into something that only looks correct |
+| reproduction | `python3 builderbro_mcp_test.py`; `python3 builderbro_mcp.py --tools`; `python3 builderbro_mcp.py --call verify_claim --json '{"tool":"read_file","arg":"memory.py","output":"<file>","expect":"contains:class MemoryStore"}'` |
+
+### Why it exists — the planner was the weak link, not the checking
+
+BuilderBro was built as a *model-driven loop*: a hosted chat model planned steps
+and the loop checked them. The unseeded live measurement says which half was
+failing: across the recorded runs the hosted hop **answered from priors instead of
+acting** — asserting `0.75` where the file said `0.25`, then writing out the JSON
+snippet it believed the file contained — and in the majority of attempts never
+called a tool at all (`live-unseeded-summary.json`).
+
+So the split now is: **an agent that already acts does the planning and the work;
+BuilderBro does the verification.** Freebuff is that agent (native tool use, in
+this repository, able to read and run), and this server is the seam. It targets
+the failure that was measured rather than the one that was assumed — the "model
+writes the file it imagines" class of defect disappears when the actor reads the
+file, because the actor is not answering from priors.
+
+The MCP server is **not** a second implementation of anything:
+
+| rule | where it actually lives |
+| --- | --- |
+| the expectation grammar (`contains:` / `regex:` / `lines:` …) | `autonomy.parse_spec` + `autonomy.verify` |
+| promotion to `invariant` / `observed`, and every named check | `verifier.confirm` |
+| what may be a fact, and when a claim may not be promoted | `memory.facts` / `memory.promote` |
+| what counts as a stub row in the evidence log | `evidence_hygiene.classify` |
+| retrieval, refusal and citation audited | the `builderbro-rag` skill's own CLI |
+
+### What a caller cannot do through it
+
+- **Cannot widen the promotion policy.** `invariant` requires a re-observation
+  *and* the tool must be in `verifier.DETERMINISTIC_TOOLS`. No argument adds a
+  tool to that set: `grep` with a matching `second_output` still confirms at
+  `observed` (asserted in `builderbro_mcp_test`).
+- **Cannot launder a claim into a fact.** `memory_record` writes at
+  `memory.level_for(evidence_level)` and refuses an `invariant` write that names
+  no independent check — `memory.promote`'s own rule, enforced at the seam. An
+  unknown provenance falls *down* to `volatile`, never up to `observed`.
+- **Cannot have a refusal reported as a malfunction.** `verify_claim`'s `ok` is
+  the verifier's own vocabulary ("was this claim confirmed"), so a refusal is
+  `ok: false` there. At the transport level a refusal is a *working* tool, so
+  `isError` stays false — otherwise a caller would retry a check that had already
+  ruled. Both directions are asserted.
+
+### The one thing a caller must supply honestly
+
+Level `invariant` needs a re-observation and this server has no tools of its own,
+so it cannot perform one. A caller may pass `second_output`: a sample it obtained
+itself. The server **does** test that against the same expectation — the check is
+real — but it cannot test the sample's *independence*, so every verdict that used
+one carries `"independence": "caller-attested"`. An agent that re-reads the file
+is doing the honest thing; one that echoes `output` back defeats the check, and
+the response labels that rather than hiding it.
+
+### Measured
+
+A client was written against the exact contract `mcp.json` declares — spawn
+`command` + `args` with inherited cwd and no `cwd` argument, newline-delimited
+framing — then a full session was driven through it:
+
+| step | result |
+| --- | --- |
+| `initialize` | `serverInfo.name: builderbro`, protocol echoed |
+| `tools/list` | all 5 tools, each schema valid JSON Schema |
+| `verify_claim` over a real file (`memory.py`) | `observed`; with `second_output` → `invariant`, `caller-attested` |
+| `verify_claim` over empty output | `refused_by: expectation_held`, `isError: false` |
+| `memory_record` demanding `invariant` with no check | refused, `error: provenance`, `isError: true`, **nothing written** |
+| `memory_record` naming its check | written at `invariant` |
+| `memory_recall` | `facts: ['read_file']`, `unverified: []`, 0 audit violations |
+| `evidence_audit` on the real Q1 log | 1780 rows, **1780 measurements, 0 artifacts** |
+| `rag_ask` (offline extractive) | answered with citations `[1, 2, 5]`, 0.79s |
+
+### Known weaknesses — do not paper over these
+
+- **The re-observation is caller-attested, and cannot be otherwise here.** The
+  channel gives a caller that wants to lie exactly one place to do it. What is
+  prevented is the *accidental* case (an expectation that does not hold, or a
+  sample that does not reproduce) and the *unlabelled* case.
+- **Tested against a client written here, not against Freebuff itself.** The
+  registry's shape (`mcpServers[name].command` / `.args` / `.env`, tools
+  namespaced `server__tool`) was read out of the installed Freebuff binary's own
+  loader, and the server was then driven over exactly that contract. That is
+  strong evidence and it is not the same as a real session loading it — that
+  check needs a Freebuff session started in this repository.
+- **A relative path in `mcp.json`, resolved against the client's cwd.** The
+  loader spawns with `{env, stdio}` and no `cwd`, so `python3 builderbro_mcp.py`
+  resolves relative to wherever Freebuff was started. Launch it in the repo root,
+  or the failure is a warning log and no tools for that step.
+- **This changes no ceiling.** The tools are read-only plus the memory store — no
+  execution, no file writes, no sandbox. Self-building is still impossible, and
+  this surface does not make it possible; it makes the *verification* usable by
+  something that can act.
+- **`rag_ask` shells out to the skill**, so it pays process start plus index load
+  (~4s measured, ~0.8s inside an already-warm call). It is deliberately not
+  inlined, so the skill keeps exactly one implementation.
+
+---
+
 ## Test suites
 
 | suite | tests | result |
 | --- | --- | --- |
 | `rag_test.py` | 55 | OK |
-| `agent_runtime_test.py` | 38 | OK |
+| `agent_runtime_test.py` | 44 | OK |
 | `brain_cascade_test.py` | 53 | OK |
-| `drift_loop_test.py` | 33 | OK |
+| `drift_loop_test.py` | 40 | OK |
 | `qih_metrics_test.py` | 21 | OK |
 | `loop_guard_test.py` | 56 | OK |
-| `autonomy_test.py` | 110 | OK |
+| `autonomy_test.py` | 126 | OK |
 | `memory_test.py` | 42 | OK |
 | `verifier_test.py` | 27 | OK |
 | `live_refusal_probe_test.py` | 8 | OK |
-| **total** | **443** | **all passing** |
+| `builderbro_mcp_test.py` | 45 | OK |
+| **total** | **517** | **all passing** |
 
 Counts are per module, each run on its own (`python3 <module>.py`); the combined
 `python3 -m unittest discover -p "*_test.py"` runs the same set. Numbers here are

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "builderbro": {
+      "command": "python3",
+      "args": ["builderbro_mcp.py"],
+      "env": {}
+    }
+  }
+}
