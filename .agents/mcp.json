@@ -3,7 +3,13 @@
     "builderbro": {
       "type": "stdio",
       "command": "python3",
-      "args": ["builderbro_mcp.py"],
+      "args": ["/mnt/sdcard/Download/builderbro/builderbro_mcp.py"],
+      "env": {}
+    },
+    "bro-bridge": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/mnt/sdcard/Download/builderbro/bro_bridge_mcp.py"],
       "env": {}
     }
   }

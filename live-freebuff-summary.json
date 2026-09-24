@@ -1,0 +1,42 @@
+{
+  "at": "2026-09-24T02:57:39Z",
+  "client_home_exists": true,
+  "cwd": "/mnt/sdcard/Download/builderbro",
+  "home": "/root/.config/manicode",
+  "pid": 26705,
+  "spawn": {
+    "ask": null,
+    "attached": {
+      "code": "E_READY_TIMEOUT",
+      "detail": {
+        "painted": true,
+        "pane_bytes": 181466,
+        "record_resolved": false,
+        "seconds": 300.1
+      },
+      "fallback_eligible": true,
+      "id": "a",
+      "message": "no ready frame within 300.0s",
+      "ok": false,
+      "retryable": true,
+      "type": "err",
+      "v": 1
+    },
+    "mcp": null,
+    "pane_bytes": 169860,
+    "seconds": 300.2,
+    "signals": [
+      {
+        "dry_run": false,
+        "pgid": 26718,
+        "pid": 26718,
+        "signal": 15
+      }
+    ],
+    "unchanged": true
+  },
+  "stages_run": [
+    "5"
+  ],
+  "steps": 3
+}

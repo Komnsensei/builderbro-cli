@@ -1,0 +1,24 @@
+{
+  "state": "waiting_for_exit",
+  "ok": null,
+  "marker_version": 1,
+  "watcher_active": false,
+  "expected": [
+    "bro-bridge__bridge_status",
+    "bro-bridge__bridge_attach",
+    "bro-bridge__bridge_observe",
+    "bro-bridge__bridge_ask",
+    "bro-bridge__bridge_capture",
+    "bro-bridge__bridge_stop",
+    "bro-bridge__bridge_shutdown"
+  ],
+  "observed": [],
+  "message": "The verifier is ready. After exiting this Freebuff session, run the launch command; it atomically changes this marker to running and then to passed or failed.",
+  "launch_command": "cd /mnt/sdcard/Download/builderbro && python3 live_freebuff_probe.py --stages 5 --ready-timeout 300 --exercise-mcp",
+  "terminal_states": [
+    "passed",
+    "failed"
+  ],
+  "summary": "live-freebuff-summary.json",
+  "transcript": "live-freebuff-transcript.jsonl"
+}

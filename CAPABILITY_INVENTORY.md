@@ -9,9 +9,9 @@ command that has been run and a number that came out of it. A capability with a
 mechanism but no measurement is `unmeasured`. Aspirational entries are
 `planned` and must not be depended on.
 
-Last updated: 2026-09-20 (the verification stack exposed over MCP so an external
-agent can call it, and a diverged working tree reconciled against the last
-commit; 517 tests)
+Last updated: 2026-09-24 (M1 of the `bro` + Freebuff brain request: the live
+session bridge and the MCP seam that exposes it, both measured against the
+operator's own running session; 776 tests)
 
 See also: **`AUTONOMY-UPGRADE.md`** — a measured assessment of what autonomy still
 lacks and the dependency-ordered plan to add it. Written 2026-09-16 as a proposal;
@@ -19,16 +19,187 @@ its A1, A2 and A3 phases are now delivered and marked as such in §4 of that fil
 Everything there beyond A3 is still `planned` and must not be depended on.
 
 Test suites (the reproduction command for every count below):
-`python3 -m unittest agent_runtime_test autonomy_test brain_cascade_test drift_loop_test loop_guard_test qih_metrics_test`
-→ 340 tests, `python3 -m unittest rag_test` → 55, `python3 memory_test.py` → 42,
-plus `verifier_test` 27, `live_refusal_probe_test` 8 and `builderbro_mcp_test` 45.
-**517 total, all pass.**
+`python3 -m unittest discover -p '*_test.py'` → **776 tests, all pass.**
+The hand-maintained enumeration that used to live here was replaced rather than
+extended: it had gone stale three times (443 → 517 → 661 → 776) and a list of
+seventeen modules is the one number in this file nobody can check. The per-module
+table at the end of this file is the breakdown, and `discover` is the total — the
+two agree.
 
-The counts in this file are also the claim most likely to go stale, and they had
-(443 → 517 was four modules' worth of tests the header had not been told about).
-They are re-measured, not carried forward.
+The counts in this file are also the claim most likely to go stale. They are
+re-measured, not carried forward.
 
 ---
+
+## Freebuff session instrument — `verified` (measurement), `unmeasured` (boot)
+
+M0 of `bro-freebuff-brain-spec.md`: the live session measured before anything is
+designed around it. The pairing rule of that spec is "no design decision may
+assume an unmeasured channel", and this is the instrument that makes a channel
+measurable and refuses to guess when it is not.
+
+| field | value |
+| --- | --- |
+| status | verified — for the lock, project, conversation, record and turn channels; `unmeasured` for boot time, torn-read rate, `--continue` and clean-exit lock release |
+| implementation | `bro_session_measure.py` — `M0-SESSION-MEASUREMENT.md` (the written numbers) |
+| entry point | `python3 bro_session_measure.py [--report FILE] [--watch S] [--spawn-probe]` |
+| runtime | python3 stdlib only; read-only — it never signals a process (`test_it_never_signals` records every `os.kill`/`os.killpg`) |
+| tests | `bro_session_measure_test.py` — 94 tests (89 when M0 was measured; the reader gained 5 later, for the `_message_spans` defect below), negative controls included |
+| measured on | client `0.0.186`, `linux-arm64`, 2026-09-23, against the operator's live session |
+
+| measured number | value |
+| --- | --- |
+| lock verdict for the operator's own live session | `live`, pid 17101, cmdline `/root/.config/manicode/freebuff` (the **core**) |
+| signals sent while classifying every lock verdict | **0** |
+| project key collisions | **2** (`/mnt/sdcard/…` and `/sdcard/…` both → `builderbro`) |
+| newest `chats/` dir vs the live conversation | **2.14 days apart** — resolved by shape, not by name |
+| record compactness | **0 newlines in 2,098,666 bytes** |
+| assistant messages with empty `content` | **5 of 5** — the answer is in `blocks[]` |
+| tool blocks, by spelling | **142 × `tool`, 0 × `tool-call`** (the spec's `§18.7` says `tool-call`; a reader written from it finds nothing) |
+| end-of-file watermark, 240 s / 1,081 polls | **4 resyncs, 0 usable deltas** — the rule in `§18.7` does not work |
+| settled watermark, same record | boundary byte **1,458,377**, **16 of 17** messages settled, **0 resyncs**, 640,289 bytes left unconsumed on purpose |
+| boundary cost | full recompute **8.496 s** → advance over the verified prefix **0.903 s** (9.4×); ~1 Hz polling |
+| session-axis raw substring hits | **27**, of which **18 are the phrase inside a payload** and 9 are real events — hence `msg`, never the raw line |
+| torn reads observed | **0 in ~1,600 polls** — *unmeasured*, not disproven |
+| a second launch | **parks** (alive at 60 s, painting a TUI, no exit code, no lock file, real lock byte-unchanged) |
+
+Reproduce: `python3 bro_session_measure_test.py` → 94 OK, then
+`python3 bro_session_measure.py --report /tmp/m0.json`.
+
+A defect in the reader was found *after* M0 was written, and is fixed rather than
+carried: `_message_spans` accepted a bare top-level string element at depth 0
+(`["oops"]`), so a malformed record could be walked as if it were a message list.
+It now refuses the scan, and `MalformedBlocksTest` holds the case.
+
+## Live session bridge — `verified` (protocol + lock safety), `unmeasured` (a round trip)
+
+M1 of `bro-freebuff-brain-spec.md` §14 is *one verified round trip*: `bro` posts a
+task, Freebuff acts, `bro` verifies, and a claim that does not hold is refused. The
+bridge is built and all seven of its tools have been driven live; the round trip
+itself is **not** observed on this box, and that word is used deliberately.
+
+| field | value |
+| --- | --- |
+| status | verified — the §18 wire protocol, the §19 lock verdicts, the refusal polarity, and every tool against the operator's real running session; `unmeasured` — a task posted into a fresh trusted session and verified |
+| implementation | `bro_bridge.py` (1,766 lines) — NDJSON line protocol (`§18`), lock state machine (`§19`) and a **disk-first** reply channel; `bro_bridge_mcp.py` (426 lines) — the MCP seam. Both stand on M0's `bro_session_measure.py` for the record reader, the lock reader and the turn resolver |
+| tests | `bro_bridge_test.py` (79), `bro_bridge_mcp_test.py` (22), `bro_session_measure_test.py` (94) |
+| entry points | `python3 bro_bridge.py --status` / `--serve` / `--call OP` / `--self-test`; `.agents/mcp.json` registers it as `bro-bridge` beside `builderbro`, so a trusted session sees `bro-bridge__bridge_*` |
+
+### What it cannot do, by construction
+
+The measured normal case on this box is that *somebody else's* session owns the
+lock — the operator's own — so "refuse, name the owner, offer read-only" is the
+main path rather than an edge case. Four consequences, each asserted rather than
+intended:
+
+- **Cannot write into a session it does not own.** `ask` with `post: true` under a
+  foreign lock is `E_LOCK_FOREIGN`, not an injection. `post: false` (`observe`) is
+  the only mode a foreign lock offers — which is what makes reading and verifying
+  somebody else's session possible at all.
+- **Cannot spawn over a live foreign owner.** Spawning happens only when the lock is
+  absent or stale (`I1`).
+- **Cannot signal a pid it does not own** (`I2`). Every signal goes through
+  `SignalLedger`, and the foreign path is asserted to have sent nothing.
+- **Cannot fabricate a reply.** A record that cannot support an answer is
+  `E_UNREADABLE` carrying the raw capture, never a guess.
+
+### The seam: seven tools, and the two polarities that matter
+
+`bro_bridge_mcp.py` is the narrow adapter between MCP and that protocol: one
+in-process `Bridge`, with the bridge's event stream routed to a null stream so its
+output can never corrupt MCP framing. It is not a second implementation of
+anything — every lifecycle and turn decision is the bridge's, including the
+error table (`§18.8`).
+
+| tool | defaults | what it is for |
+| --- | --- | --- |
+| `bridge_status` | — | lock verdict, owner, project, session axis; read-only |
+| `bridge_attach` | `adopt: true`, `spawn: false`; absolute `cwd` required | attach read-only to a foreign session. `spawn: true` is explicit and turns `adopt` off |
+| `bridge_observe` | `post: false` (forced) | read the record without asking anything |
+| `bridge_ask` | `post: true`; `turn_id` and `task` required | post a task and resolve the verified reply |
+| `bridge_capture` | `bytes` | last-resort pane capture, explicitly not a reply |
+| `bridge_stop` | `graceful` | stop a session **this process owns** |
+| `bridge_shutdown` | — | release what this process owns |
+
+A refusal is a *working decision*, not a broken tool, so the refusal codes
+(`E_LOCK_FOREIGN`, `E_LOCK_MALFORMED`, `E_PROJECT_AMBIGUOUS`, `E_REFUSED`) keep
+`isError: false` — a caller must not retry a check that has already ruled.
+Everything else — `E_NO_SESSION`, an unreadable record, a dead child — stays an MCP
+error, so a transport failure is never mistaken for an answer. Both directions are
+asserted.
+
+### Measured — the seven tools, against the operator's own live session
+
+The registered server was spawned exactly as `.agents/mcp.json` names it and driven
+over newline-delimited JSON-RPC against the real live lock:
+
+| call | result | `isError` |
+| --- | --- | --- |
+| `bridge_status` | `res` | false |
+| `bridge_attach` | `res`, `state: FOREIGN`, `read_only: true` | false |
+| `bridge_observe` | `res`, `state: FOREIGN` | false |
+| `bridge_ask` (default `post: true`) | `err E_LOCK_FOREIGN` — **a refusal, not a malfunction** | **false** |
+| `bridge_capture` | `err E_NO_SESSION` | true |
+| `bridge_stop` | `err E_NO_SESSION` | true |
+| `bridge_shutdown` | `res` | false |
+
+Every result is the designed one, including the two that are errors: there is no
+session of ours to capture from or stop, and saying so is the correct answer rather
+than a `res` with an empty body.
+
+### The completion marker — what it is, and why it is not armed
+
+Stage 5 of `live_freebuff_probe.py` spawns a second instance under an isolated
+`HOME` and asks it to call all seven tools in order. That run's verdict is written
+to `live-fresh-mcp-status.json` by `mcp_completion()` and published atomically
+(`tmp` → `flush` → `fsync` → `os.replace`), so a reader never sees half a document.
+The verdict is strict — non-`res` attach, a changed operator lock, an empty
+exercise, a missing, unexpected, duplicated or out-of-order tool each fail it —
+and its terminal states are exactly `passed` and `failed`.
+
+It is currently `waiting_for_exit`, which is the honest state: nothing here can arm
+a watcher. This box has no background-process facility (`BACKGROUND` is
+unimplemented, `nohup` children do not survive the next check, and there is no
+`tmux`, `screen` or `at`), so the marker stores the launch command and the
+operator must run it **after** the session that wrote it exits:
+
+    python3 live_freebuff_probe.py --stages 5 --ready-timeout 300 --exercise-mcp
+
+### The live check — where it stands, measured
+
+M1's own exit criterion is a **live transcript + summary JSON**: task in → action
+observed → verdict out, twice in a row on one attached session. That transcript
+does not exist, and the reason is measured rather than guessed. On this box the
+fresh isolated client **never reaches a prompt**: it paints the TUI (181,466 bytes)
+and sits at `Connecting…` until the ready timeout — `E_READY_TIMEOUT` at 35 s, 90 s,
+120 s and 300 s across four runs — with `record_resolved: false`, the operator's
+lock byte-unchanged, and a signal ledger containing only our own child. The seven
+calls above are therefore the strongest M1 evidence that exists here, and they come
+from the registered server driven directly, **not** from a model.
+
+Getting even that far fixed a harness defect the earlier runs had hidden: `seed_home`
+*symlinked* the `freebuff` executable back to the real client, so the "isolated"
+instance resolved the operator's own home and painted someone else's session. It now
+copies the binary and symlinks only data files, and the failure changed from a
+silent wrong-session to a named `E_READY_TIMEOUT`.
+
+### Known weaknesses — do not paper over these
+
+- **M1 has no round trip.** A live task posted into a trusted session and verified is
+  the milestone's whole point and it is `unmeasured`. The bridge refuses to simulate
+  it: everything above is a refusal path, because on this box the lock is foreign by
+  default.
+- **A true live post is forbidden by design**, not merely blocked. Posting into the
+  operator's own session would be exactly the write `I1`/`I2` exist to prevent.
+  Cloning the session is the only path, and a clone does not come up here.
+- **`E_READY_TIMEOUT` is the spec's own predicted failure** (`§19.9`), which makes it
+  a known gap rather than a surprise — but "predicted" is not "handled".
+- **The MCP `args` are absolute local pins.** If the repository moves, the registry
+  must be re-pinned; `RegistryTest` fails when the pinned file is gone.
+- **`bridge_capture` is a last resort, not a channel.** The reply path is the record;
+  the pane is for liveness and for the case where the record cannot answer.
+- **`E_UNREADABLE` is asserted, not exercised live.** M0 observed 0 torn reads in
+  ~1,600 polls, so the hazard path is covered by tests and negcontrols only.
 
 ## RAG pipeline — `verified`
 
@@ -802,8 +973,8 @@ three-digit values, and the alternative (requiring an `HTTP ` prefix) would lose
 | --- | --- |
 | status | verified |
 | implementation | `builderbro_mcp.py` — a stdio MCP server exposing the verification stack as five tools: `verify_claim` (A3), `memory_recall` / `memory_record` (A2), `rag_ask` (the `builderbro-rag` skill), `evidence_audit` (`evidence_hygiene`). JSON-RPC 2.0, newline-delimited, stdlib only, no network of its own |
-| entry points | `.agents/mcp.json` registers it. Freebuff's loader walks `<cwd>/.agents`, `<cwd>/../.agents` and `~/.agents`, opens `mcp.json` in each, and namespaces loaded tools `builderbro__<tool>`; it reads **nothing at the repository root**, and the entry schema is a `strictObject` (`type` / `command` / `args` / `env` only, so `cwd` is not settable). `RegistryTest` asserts both. Also a shell CLI: `--tools`, `--call NAME --json '{...}'`, or serve on stdio |
-| tests | `builderbro_mcp_test.py` (51). One spawns the server exactly as `.agents/mcp.json` names it and completes a live `initialize` + `tools/list` handshake; six more (`RegistryTest`) assert placement, key set, transport, env and namespacing against the loader's own code — each with its negative control run, so the registry cannot rot into a file that only looks correct |
+| entry points | `.agents/mcp.json` registers it. Freebuff's loader walks `<cwd>/.agents`, `<cwd>/../.agents` and `~/.agents`, opens `mcp.json` in each, and namespaces loaded tools `builderbro__<tool>`; it reads **nothing at the repository root**, and the entry schema is a `strictObject` (`type` / `command` / `args` / `env` only, so `cwd` is not settable — which is why the `args` entry is an **absolute** path: discovery walks up from the client's cwd while the spawn inherits it). `RegistryTest` asserts placement, the key set, and both spawn forms. Also a shell CLI: `--tools`, `--call NAME --json '{...}'`, or serve on stdio |
+| tests | `builderbro_mcp_test.py` (55). One spawns the server exactly as `.agents/mcp.json` names it and completes a live `initialize` + `tools/list` handshake; two more spawn it from a cwd that is *not* the repository — one proving the relative form dies there, one proving every tool still finds this repository — and six (`RegistryTest`) assert placement, key set, transport, env, namespacing and the pinned path against the loader's own code, each with its negative control run, so the registry cannot rot into a file that only looks correct. A full-tree audit (`source_integrity_test.py`, 5) now fails when any source in this tree stops parsing, because four of them did while the suite stayed green |
 | reproduction | `python3 builderbro_mcp_test.py`; `python3 builderbro_mcp.py --tools`; `python3 builderbro_mcp.py --call verify_claim --json '{"tool":"read_file","arg":"memory.py","output":"<file>","expect":"contains:class MemoryStore"}'` |
 
 ### Why it exists — the planner was the weak link, not the checking
@@ -910,11 +1081,25 @@ reports what it saw rather than what it hoped for.
   the check to run is `python3 live_mcp_probe.py` with **no other Freebuff session
   open**, or asking a session in this repository to call `builderbro__verify_claim`
   directly.
-- **The spawn command is relative and cannot be pinned.** `cwd` is not an allowed
-  key in the loader's `strictObject`, so `python3 builderbro_mcp.py` resolves
-  against the client's process cwd, and discovery is rooted at that same cwd.
-  Launch Freebuff in the repository root: the loader only walks `.agents`
-  directories under the cwd, its parent, and `$HOME`.
+- **The spawn is pinned by an absolute path, and the tools are anchored to this
+  repository rather than the client's cwd.** `cwd` is still not an allowed key in
+  the loader's `strictObject`, so `args` names
+  `/mnt/sdcard/Download/builderbro/builderbro_mcp.py` outright. Discovery walks
+  *up* from the cwd while the spawn *inherits* it, so a session started in a
+  subdirectory found the registry and then failed to start the server — measured:
+  the relative form dies with `No such file or directory`.
+  `builderbro_mcp_test.RegistryTest` executes both forms. The residence-relative
+  defaults (`evidence_audit` with no `paths`, the memory store) are resolved
+  against `builderbro_mcp.py`'s own directory for the same reason: from a foreign
+  cwd `evidence_audit` returned `missing_log` before that fix, and now reports the
+  repository's 1,780 rows. Discovery itself is still rooted at the client's cwd
+  (`.agents` under the cwd, its parent, and `$HOME`), so launch Freebuff inside
+  this repository — or register the same entry at `~/.agents/mcp.json` to have the
+  tools in every project.
+- **That absolute path is a local pin.** If the repository moves, the registry
+  must be re-pinned. This is guarded rather than remembered: `RegistryTest` fails
+  when the pinned file is gone and `source_integrity_test.py` fails when a source
+  stops parsing, so the bridge cannot rot into a file that only looks correct.
 - **This changes no ceiling.** The tools are read-only plus the memory store — no
   execution, no file writes, no sandbox. Self-building is still impossible, and
   this surface does not make it possible; it makes the *verification* usable by
@@ -932,21 +1117,26 @@ reports what it saw rather than what it hoped for.
 | `rag_test.py` | 55 | OK |
 | `agent_runtime_test.py` | 44 | OK |
 | `brain_cascade_test.py` | 53 | OK |
-| `drift_loop_test.py` | 40 | OK |
+| `drift_loop_test.py` | 46 | OK |
 | `qih_metrics_test.py` | 21 | OK |
 | `loop_guard_test.py` | 56 | OK |
 | `autonomy_test.py` | 126 | OK |
 | `memory_test.py` | 42 | OK |
 | `verifier_test.py` | 27 | OK |
 | `live_refusal_probe_test.py` | 8 | OK |
-| `builderbro_mcp_test.py` | 51 | OK |
+| `builderbro_mcp_test.py` | 55 | OK |
 | `live_mcp_probe_test.py` | 28 | OK |
-| **total** | **551** | **all passing** |
+| `policy_search_test.py` | 15 | OK |
+| `bro_session_measure_test.py` | 94 | OK |
+| `bro_bridge_test.py` | 79 | OK |
+| `bro_bridge_mcp_test.py` | 22 | OK |
+| `source_integrity_test.py` | 5 | OK |
+| **total** | **776** | **all passing** |
 
 Counts are per module, each run on its own (`python3 <module>.py`); the combined
-`python3 -m unittest discover -p "*_test.py"` runs the same set. Numbers here are
-measured, and were stale once already — a count in a document is a claim like any
-other.
+`python3 -m unittest discover -p "*_test.py"` runs the same set and reports the
+same 776. Numbers here are measured, and this table has gone stale three times
+already (551 → 670 → 776) — a count in a document is a claim like any other.
 
 These instruments sit beside the tests and are not part of that count:
 
@@ -957,4 +1147,5 @@ These instruments sit beside the tests and are not part of that count:
 | `evidence_hygiene.py` | whether the published Q1 evidence log is measurements or test artifacts — classifying a row only on **positively identified stub markers**, never on "an endpoint I don't recognise", so a new real backend is not quarantined by a tool that has not heard of it |
 | `verifier_test.py` | the verifier's own two controls, plus the rule that a pass-through verifier is reported `no_verifier` rather than as a pass |
 | `live_refusal_probe.py` | the refusal path and **unseeded execution** against a **real model** over the real cascade: it drives `autonomy.run_goal_verified` exactly as production does, records the transcript verbatim, and classifies the model's reply to the rejection note (including `replan_unlabelled`, the repair the loop used to discard). `--report <summary>` reprints and `--register --cycle {refusal,unseeded}` closes either cycle **without spending requests again**, which is why a saved summary exists. The only instrument here that spends requests, so nothing else ever runs it |
+| `live_freebuff_probe.py` | M0/M1's staged live probe: it measures the session (§1–4), then stage 5 spawns a second instance under an isolated `HOME` — the binary **copied**, only data files symlinked, because symlinking the executable back to the real client made the "isolated" instance resolve the operator's own home — types one deterministic prompt asking for all seven `bro-bridge` tools in order, and publishes a strict `passed`/`failed` verdict to `live-fresh-mcp-status.json`. It refuses to be armed here: nothing on this box survives the session that launches it, so the marker stores the launch command instead |
 | `live_mcp_probe.py` | whether a **real Freebuff session** loads `.agents/mcp.json`: it starts `freebuff --trust-agents` on a pty, answers the terminal queries a TUI blocks on, types one read-only prompt that requires the tool, and classifies the transcript `loaded` / `rejected` / `inconclusive` — removing its own prompt echo first, because a pty echoes input and the naive search matched the probe's own words (it reported `loaded` on 270 bytes of itself). `--classify FILE` re-scores a saved transcript |
