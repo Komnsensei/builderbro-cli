@@ -393,11 +393,17 @@ def _replies_stub(replies):
     return chat
 
 
-def run_task(task, config=None, live=False):
-    """Run one task. Returns a scored result dict."""
+def run_task(task, config=None, live=False, thresholds=None):
+    """Run one task. Returns a scored result dict.
+
+    `thresholds` lets a caller replay the suite under a candidate policy instead
+    of the one registered on disk — this is the seam `policy_search.py` searches
+    through. None means "whatever `loop_guard.json` says", so every existing
+    caller is unchanged.
+    """
     budget = task["budget"]
     guard = loop_guard.LoopGuard(budget["max_tool_steps"], emit=False)
-    thresholds = dict(loop_guard.active_thresholds())
+    thresholds = dict(loop_guard.active_thresholds() if thresholds is None else thresholds)
     chat_fn = None if live else _replies_stub(task["replies"])
     if live:
         os.environ.setdefault("LOOP_GUARD_EMIT", "1")
@@ -444,8 +450,12 @@ def run_task(task, config=None, live=False):
     }
 
 
-def run_suite(config=None, live=False, root=None):
-    """Run all 20 tasks. Returns (results, suite_errors)."""
+def run_suite(config=None, live=False, root=None, thresholds=None):
+    """Run all 20 tasks. Returns (results, suite_errors).
+
+    `thresholds` is threaded through to every task so the whole suite can be
+    replayed under one candidate policy.
+    """
     owned = root is None
     root = root or tempfile.mkdtemp(prefix="autonomy-suite-")
     try:
@@ -454,7 +464,8 @@ def run_suite(config=None, live=False, root=None):
         errors = validate_solvability(tasks)
         if errors:
             return [], errors
-        results = [run_task(t, config=config, live=live) for t in tasks]
+        results = [run_task(t, config=config, live=live, thresholds=thresholds)
+                   for t in tasks]
         return results, []
     finally:
         if owned:
