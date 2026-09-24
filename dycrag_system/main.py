@@ -3,6 +3,9 @@ import sys
 
 # --- Self-correction: Ensure dependency files are correctly written ---
 
+knowledge_base_content = '''
+import os
+
 class KnowledgeBase:
     def __init__(self, docs_dir="docs"):
         self.docs_dir = docs_dir
@@ -35,9 +38,7 @@ class KnowledgeBase:
         for doc_name, content in self.documents.items():
             content_lower = content.lower()
             if any(keyword in content_lower for keyword in query_keywords):
-                results.append(f"--- Document: {doc_name} ---
-{content}
-")
+                results.append(f"--- Document: {doc_name} ---\\n{content}\\n")
         
         return results
 
@@ -45,24 +46,22 @@ if __name__ == "__main__":
     # Simple test for KnowledgeBase
     kb = KnowledgeBase()
     
-    print("
---- Test Search 1 (AI) ---")
+    print("\\n--- Test Search 1 (AI) ---")
     results1 = kb.search("AI")
     for r in results1:
         print(r)
 
-    print("
---- Test Search 2 (RAG) ---")
+    print("\\n--- Test Search 2 (RAG) ---")
     results2 = kb.search("RAG")
     for r in results2:
         print(r)
 
-    print("
---- Test Search 3 (newstate) ---")
+    print("\\n--- Test Search 3 (newstate) ---")
     results3 = kb.search("newstate")
     for r in results3:
-        print(r)"""
+        print(r)'''
 
+agent_content = '''
 import os
 
 class DyCRAGAgent:
@@ -88,12 +87,9 @@ class DyCRAGAgent:
         
         response_parts = []
         if context:
-            response_parts.append("Based on the following information:" + "
-" + context + "
-")
+            response_parts.append("Based on the following information:" + "\\n" + context + "\\n")
         else:
-            response_parts.append("Based on my current knowledge." + "
-")
+            response_parts.append("Based on my current knowledge." + "\\n")
         
         # Simulate some synthesis based on the goal
         if "what are agents" in self.state["current_goal"].lower() and "agentic ai" in context.lower():
@@ -105,8 +101,7 @@ class DyCRAGAgent:
         else:
             response_parts.append(f"Regarding '{self.state['current_goal']}', my understanding leads me to believe...")
 
-        return "
-".join(response_parts)
+        return "\\n".join(response_parts)
 
     def _determine_retrieval_query(self, current_goal: str) -> str:
         """Determines what to search for in the knowledge base, evolving with understanding."""
@@ -140,8 +135,7 @@ class DyCRAGAgent:
             print("Agent accumulated new information chunks.")
             
             # Synthesize accumulated chunks into a coherent understanding
-            full_context = "
-".join(self.state["understanding_chunks"])
+            full_context = "\\n".join(self.state["understanding_chunks"])
             self.state["synthesized_understanding"] = self._call_llm_placeholder(
                 prompt=f"Synthesize the following information about '{self.state['current_goal']}' into a concise understanding.",
                 context=full_context
@@ -152,8 +146,7 @@ class DyCRAGAgent:
 
     def iterate(self, initial_goal: str, max_iterations: int = 5):
         self.state["current_goal"] = initial_goal
-        print(f"Agent Goal: {initial_goal}
-")
+        print(f"Agent Goal: {initial_goal}\\n")
 
         for i in range(1, max_iterations + 1):
             print(f"--- Agent Iteration {i} ---")
@@ -186,18 +179,14 @@ class DyCRAGAgent:
         print("--- Final Agent Summary ---")
         print(f"Goal: {self.state['current_goal']}")
         print(f"Total LLM Placeholder Calls: {self.state['llm_calls_count']}")
-        print("
-Final Synthesized Understanding:
-")
+        print("\\nFinal Synthesized Understanding:\\n")
         print(self.state["synthesized_understanding"] if self.state["synthesized_understanding"] else "No coherent understanding synthesized.")
 
-        print("
-Final Generated Response (based on synthesized understanding):
-")
+        print("\\nFinal Generated Response (based on synthesized understanding):\\n")
         print(self._call_llm_placeholder(
             prompt=f"Provide a final answer to the goal: '{self.state['current_goal']}' based on all gathered information.",
             context=self.state["synthesized_understanding"]
-        ))"""
+        ))'''
 
 print("DEBUG: main.py started execution.")
 

@@ -3,8 +3,7 @@ function logInternalState(data) {
     try {
         const logFilePath = 'self_observability.log';
         const timestamp = new Date().toISOString();
-        const logEntry = JSON.stringify({ timestamp, ...data }) + '
-';
+        const logEntry = JSON.stringify({ timestamp, ...data }) + '\n';
         fs.appendFileSync(logFilePath, logEntry, 'utf8');
         return `Logged internal state to ${logFilePath}`;
     } catch (error) {

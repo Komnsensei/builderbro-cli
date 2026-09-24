@@ -1,3 +1,4 @@
+
 import os
 
 class KnowledgeBase:
@@ -32,9 +33,7 @@ class KnowledgeBase:
         for doc_name, content in self.documents.items():
             content_lower = content.lower()
             if any(keyword in content_lower for keyword in query_keywords):
-                results.append(f"--- Document: {doc_name} ---\
-{content}\
-")
+                results.append(f"--- Document: {doc_name} ---\n{content}\n")
         
         return results
 
@@ -42,20 +41,17 @@ if __name__ == "__main__":
     # Simple test for KnowledgeBase
     kb = KnowledgeBase()
     
-    print("\
---- Test Search 1 (AI) ---")
+    print("\n--- Test Search 1 (AI) ---")
     results1 = kb.search("AI")
     for r in results1:
         print(r)
 
-    print("\
---- Test Search 2 (RAG) ---")
+    print("\n--- Test Search 2 (RAG) ---")
     results2 = kb.search("RAG")
     for r in results2:
         print(r)
 
-    print("\
---- Test Search 3 (newstate) ---")
+    print("\n--- Test Search 3 (newstate) ---")
     results3 = kb.search("newstate")
     for r in results3:
         print(r)

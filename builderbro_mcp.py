@@ -102,7 +102,24 @@ def fail(error, reason, **extra):
 
 
 def _residence(env):
-    return env.get("DRIVE_RESIDENCE") or DEFAULT_RESIDENCE
+    """Where the residence-relative defaults resolve.
+
+    Anchored at this file's own directory, never at the process cwd. Freebuff
+    spawns this server with an inherited cwd (`cwd` is not a key its registry
+    schema allows) and a session may be started from a subdirectory of the
+    repository, so a relative default quietly audits a log that is not there:
+    measured, `evidence_audit` with no `paths` returned `missing_log` from a
+    cwd that was not the repository.
+
+    An explicit `DRIVE_RESIDENCE` still wins — that is how the suites point
+    themselves at a throwaway home — and a relative one is read as relative to
+    this repository, so every tool means the same thing wherever the session was
+    started.
+    """
+    given = (env.get("DRIVE_RESIDENCE") or "").strip()
+    if not given:
+        return os.path.join(HERE, DEFAULT_RESIDENCE)
+    return given if os.path.isabs(given) else os.path.join(HERE, given)
 
 
 def _memory_store_path(args, env):

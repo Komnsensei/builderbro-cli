@@ -333,6 +333,23 @@ class EvidenceAuditTest(_Temp):
         reported = payload["logs"][0]["path"]
         self.assertTrue(reported.startswith(residence), reported)
         self.assertTrue(reported.endswith(os.path.join("evidence", "q1-evidence.jsonl")), reported)
+    def test_the_default_residence_does_not_move_with_the_client_cwd(self):
+        # The client spawns this server with an inherited cwd, so a relative
+        # default is a function of where the session happened to be started.
+        # From a cwd that is not the repository the default must still be this
+        # repository's own residence — measured before the anchor fix:
+        # `{"error": "missing_log", "isError": true}` from a foreign cwd.
+        saved = os.environ.pop("DRIVE_RESIDENCE", None)
+        if saved:
+            self.addCleanup(os.environ.__setitem__, "DRIVE_RESIDENCE", saved)
+        start = os.getcwd()
+        self.addCleanup(os.chdir, start)
+        os.chdir(self.dir)
+        payload = self.ok("evidence_audit")
+        log = payload["logs"][0]
+        self.assertTrue(os.path.isabs(log["path"]), log["path"])
+        self.assertTrue(log["path"].startswith(HERE), log["path"])
+        self.assertGreater(log["rows"], 0)
 
 
 # ── 6. rag_ask: delegation, not reimplementation ─────────────────────────────
@@ -507,6 +524,33 @@ class CliTest(_Temp):
         for name in names:
             self.assertNotIn("__", name, "the loader prefixes the server name with `__`")
 
+    def test_the_tools_find_the_repository_from_a_foreign_cwd(self):
+        # The whole bridge, started the way the client starts it — inherited cwd,
+        # newline-delimited framing — from a directory that is not the
+        # repository. The residence-relative defaults must still resolve to this
+        # repository: before the anchor fix this returned `missing_log` with
+        # `isError: true`, which a client reports as a tool that failed.
+        import subprocess
+        import tempfile
+
+        entry = json.load(open(REGISTRY, encoding="utf-8"))["mcpServers"]["builderbro"]
+        env = {k: v for k, v in os.environ.items() if k != "DRIVE_RESIDENCE"}
+        with tempfile.TemporaryDirectory() as foreign:
+            proc = subprocess.run(
+                [entry["command"]] + entry["args"], cwd=foreign, env=env,
+                input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
+                      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":'
+                      '{"name":"evidence_audit","arguments":{}}}\n',
+                capture_output=True, text=True, timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+        result = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()][-1]["result"]
+        self.assertFalse(result["isError"], result.get("content"))
+        payload = json.loads(result["content"][0]["text"])
+        self.assertTrue(payload.get("ok"), payload)
+        self.assertEqual(payload["logs"][0]["path"],
+                         os.path.join(HERE, "freebrain-residence", "evidence",
+                                      "q1-evidence.jsonl"))
+
 
 # ── 9. The registry, against the loader's own contract ───────────────────────
 
@@ -579,6 +623,49 @@ class RegistryTest(_Temp):
             with self.subTest(server=name):
                 self.assertNotIn("__", name)
                 self.assertEqual(name, name.strip())
+
+    def test_the_spawn_is_pinned_to_an_absolute_path(self):
+        # Discovery walks *up* from the cwd (`<cwd>/.agents`, `<cwd>/../.agents`,
+        # `~/.agents`), but the spawn the loader performs inherits that same cwd
+        # and `cwd` is not a key its schema allows — so a relative path is the
+        # one part of this contract the registry cannot express. Starting a
+        # session one directory down still finds this file and then fails to
+        # start the server. Pin the path.
+        for name, entry in self.entries().items():
+            with self.subTest(server=name):
+                for arg in entry.get("args", []):
+                    if os.sep in arg or arg.endswith(".py"):
+                        self.assertTrue(
+                            os.path.isabs(arg),
+                            "%r resolves against the client's process cwd" % arg)
+                        self.assertTrue(os.path.isfile(arg), arg)
+
+    def test_a_subdirectory_launch_is_what_pins_the_path(self):
+        # Negative control, executed rather than asserted: from a directory one
+        # level below the repository the loader still finds `.agents/mcp.json`
+        # because it walks up, so the argument's resolution is the only thing
+        # left that can break the bridge — and the relative form does, with the
+        # `FileNotFoundError` the client reports as a server that failed to
+        # start.
+        import subprocess
+
+        entry = self.entries()["builderbro"]
+        subdir = os.path.join(HERE, ".agents")
+
+        def spawn(args):
+            return subprocess.run(
+                [entry["command"]] + args, cwd=subdir,
+                input='{"jsonrpc":"2.0","id":1,"method":"initialize"}\n',
+                capture_output=True, text=True, timeout=120)
+
+        relative = spawn([os.path.basename(entry["args"][0])])
+        self.assertNotEqual(relative.returncode, 0, relative.stdout)
+        self.assertIn("No such file or directory", relative.stderr)
+
+        pinned = spawn(entry["args"])
+        self.assertEqual(pinned.returncode, 0, pinned.stderr[-400:])
+        reply = json.loads(pinned.stdout.splitlines()[0])
+        self.assertEqual(reply["result"]["serverInfo"]["name"], "builderbro")
 
 
 if __name__ == "__main__":
