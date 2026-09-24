@@ -186,7 +186,11 @@ python3 autonomy_suite.py                           # 20 scored tasks, 8 pre-reg
   `cli1.mjs`, `cli12.mjs` (10 leaked `SEARCH`/`REPLACE` patch markers), the
   gitignored `dist/server.js` and files under `repo-fixes/`. Repairing them would
   mean inventing intent; their exact sites are named in `REPO-AUDIT-2026-09-23.md`.
-- **GitHub reports 12 Dependabot advisories on the default branch** (4 high,
-  8 moderate) at the last push.
+- **GitHub reports 11 open Dependabot advisories on the default branch** (4 high,
+  7 moderate), and all of them are in one manifest —
+  `passionstate-nexus/package-lock.json` (`fast-uri` ×4 high, `hono` ×3, `qs` ×2,
+  `vitest` + `@vitest/mocker` ×2). The count is read from the API, not from the push
+  banner: the banner said 12 minutes earlier and the advisory set is not stable
+  between pushes, so a number quoted from it is stale before it is written down.
 - **Hosted providers are optional and rate-limited.** The local-first path is the
   tested one; anything cloud needs your own keys, and free tiers are hard caps.
