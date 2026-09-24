@@ -44,7 +44,14 @@ import { detectGoogleCloudContext, discoverVertexModels, chooseVertexModel, load
 var APP  = process.env.BASE44_APP_ID  || "69d81ac3ffa24327b49b171a";
 var CONV = process.env.BASE44_CONV_ID || "69f9a8f3e048816e89717604";
 var TOKEN = process.env.BASE44_TOKEN   || "";
-var GROQ_KEY = process.env.GROQ_KEY    || "";
+// "GROQ_KEY" is the legacy name; .env and .env.example document GROQ_API_KEY
+// (with numbered siblings _2.._9 and an optional csv GROQ_API_KEYS). Only the
+// legacy name used to be read here, so a correctly-configured .env was ignored
+// and the loader silently fell through to the next provider.
+var GROQ_KEY = [process.env.GROQ_KEY, process.env.GROQ_API_KEYS, process.env.GROQ_API_KEY]
+  .concat([2,3,4,5,6,7,8,9].map(function(n){ return process.env["GROQ_API_KEY_"+n]; }))
+  .map(function(v){ return String(v||"").split(",")[0].trim(); })
+  .filter(Boolean)[0] || "";
 var OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 var MODEL_PREFERENCE_F = modelPreferencePath(join(homedir(), ".bro"));
 var SELECTED_VERTEX_MODEL = process.env.GCP_MODEL || loadModelPreference(MODEL_PREFERENCE_F) || "";
@@ -116,13 +123,16 @@ async function askBase44(prompt, ret){
   throw new Error("Base44 failed");
 }
 
-async function askOpenAICompat(baseUrl, key, prompt, ret){
+async function askOpenAICompat(baseUrl, key, prompt, ret, model){
+  // The model has to match the provider being called: sending OpenAI's
+  // "gpt-4o-mini" to the Groq endpoint is a 404/400, not an answer.
+  var chosenModel = model || process.env.OPENAI_MODEL || "gpt-4o-mini";
   for(var i=0;i<ret;i++){
     try{
       var r = await fetch(baseUrl.replace(/\/$/,"")+"/chat/completions", {
         method:"POST",
         headers:{"Content-Type":"application/json","Authorization":"Bearer "+key},
-        body:JSON.stringify({ model: process.env.GROQ_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini", messages:[{role:"user",content:prompt}] }),
+        body:JSON.stringify({ model: chosenModel, messages:[{role:"user",content:prompt}] }),
         signal: AbortSignal.timeout(120000)
       });
       if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
@@ -155,9 +165,9 @@ async function pipeAnswer(instruction, content){
   if (localModelConfig())     { try { return await askLocal(prompt, 2); } catch(e){ lastErr = e; } }
   try{ return await askVertex(prompt, 2); }catch(e){ lastErr = e; }
   if (TOKEN)            { try { return await askBase44(prompt, 2); } catch(e){ lastErr = e; } }
-  if (GROQ_KEY)         { try { return await askOpenAICompat("https://api.groq.com/openai/v1", GROQ_KEY, prompt, 2); } catch(e){ lastErr = e; } }
+  if (GROQ_KEY)         { try { return await askOpenAICompat("https://api.groq.com/openai/v1", GROQ_KEY, prompt, 2, process.env.GROQ_MODEL || "openai/gpt-oss-120b"); } catch(e){ lastErr = e; } }
   if (OPENAI_KEY)       { try { return await askOpenAICompat(process.env.OPENAI_BASE_URL || "https://api.openai.com/v1", OPENAI_KEY, prompt, 2); } catch(e){ lastErr = e; } }
-  console.error("No LLM brain available. Start a local open-weight server and set LOCAL_MODEL_URL (see .env.example), set up gcloud (gcloud auth login && gcloud config set project ID), or set BASE44_TOKEN / GROQ_KEY / OPENAI_API_KEY (env or .env). "+(lastErr?("Last error: "+lastErr.message):""));
+  console.error("No LLM brain available. Start a local open-weight server and set LOCAL_MODEL_URL (see .env.example), set up gcloud (gcloud auth login && gcloud config set project ID), or set BASE44_TOKEN / GROQ_API_KEY / OPENAI_API_KEY (env or .env). "+(lastErr?("Last error: "+lastErr.message):""));
   process.exit(1);
 }
 

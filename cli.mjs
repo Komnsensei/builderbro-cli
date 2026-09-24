@@ -80,6 +80,8 @@ var MAX_DEPTH=8;
 var APP=process.env.BASE44_APP_ID||"";
 var TOKEN=process.env.BASE44_TOKEN||"";
 var GROQ_KEY=process.env.GROQ_API_KEY||"";
+var CEREBRAS_KEY=process.env.CEREBRAS_API_KEY||"";
+var OPENAI_KEY=process.env.OPENAI_API_KEY||"";
 var tgPollTimer=null;
 var tgBase="";
 // Local open-weight backend (Ollama / vLLM / llama.cpp) — when configured,
@@ -890,7 +892,7 @@ try{mkdirSync(DATA_DIR,{recursive:true});}catch{}
 
 var TOKEN=process.env.BASE44_TOKEN||"";
 var APP="69d81ac3ffa24327b49b171a",CONV="69f9a8f3e048816e89717604",MAX_DEPTH=5,MAX_OUT=15000;
-var GROQ_KEY=process.env.GROQ_KEY||"";
+var GROQ_KEY=process.env.GROQ_KEY||process.env.GROQ_API_KEY||"";
 var TAVILY_KEY=process.env.TAVILY_KEY||"";
 var GITHUB_TOKEN=process.env.GITHUB_TOKEN||"";
 var GH_CONFIG_F=join(DATA_DIR,"github.json");
@@ -1954,6 +1956,66 @@ function buildVertex403Message(errBody, projectId, region, model){
   return lines.join("\n");
 }
 
+// ---- Cloud fallback brain ------------------------------------------------
+// Used when the local model isn't running and Vertex/gcloud isn't configured.
+// Before this existed, askChat hard-threw unless gcloud was set up, so a machine
+// holding perfectly good Groq/Cerebras/OpenAI keys still couldn't answer.
+function cloudProviders(){
+  var out=[];
+  if(GROQ_KEY)      out.push({name:"Groq",     baseUrl:"https://api.groq.com/openai/v1", key:GROQ_KEY,      model:process.env.GROQ_MODEL||"openai/gpt-oss-120b"});
+  if(CEREBRAS_KEY)  out.push({name:"Cerebras", baseUrl:"https://api.cerebras.ai/v1",      key:CEREBRAS_KEY,  model:process.env.CEREBRAS_MODEL||"llama3.1-8b"});
+  if(OPENAI_KEY)    out.push({name:"OpenAI",   baseUrl:process.env.OPENAI_BASE_URL||"https://api.openai.com/v1", key:OPENAI_KEY, model:process.env.OPENAI_MODEL||"gpt-4o-mini"});
+  return out;
+}
+function toOpenAIMessages(chatHistory){
+  var msgs=[{role:"system", content:buildSys()}];
+  (chatHistory||[]).forEach(function(m){
+    var text=(m.parts||[]).map(function(p){return p.text||"";}).join("");
+    if(!text) return;
+    msgs.push({role:m.role==="model"?"assistant":(m.role||"user"), content:text});
+  });
+  return msgs;
+}
+async function askCloudFallback(chatHistory, ret, abortSignal){
+  var providers=cloudProviders(), lastErr=null;
+  for(var p=0;p<providers.length;p++){
+    var prov=providers[p];
+    for(var i=0;i<(ret||3);i++){
+      try{
+        var s=Date.now();
+        var timeoutSignal=AbortSignal.timeout(120000);
+        var r=await fetch(prov.baseUrl.replace(/\/$/,"")+"/chat/completions", {
+          method:"POST",
+          headers:{"Content-Type":"application/json","Authorization":"Bearer "+prov.key},
+          body:JSON.stringify({ model: prov.model, messages: toOpenAIMessages(chatHistory) }),
+          signal: abortSignal ? AbortSignal.any([abortSignal, timeoutSignal]) : timeoutSignal
+        });
+        if(r.status===429||r.status>=500){ await sleep((i+1)*3000); continue; }
+        if(!r.ok){
+          var body=""; try{ body=await r.text(); }catch(_){}
+          throw new Error(prov.name+" API "+r.status+(body?" - "+body.substring(0,200):""));
+        }
+        var d=await r.json();
+        var content=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||"No response";
+        var tokens=(d.usage&&d.usage.total_tokens)||0;
+        stats.totalTokens+=tokens;
+        saveStat();
+        return { content:content, elapsed:((Date.now()-s)/1000).toFixed(1), tokens:tokens, provider:prov.name };
+      }catch(e){
+        if(abortSignal && abortSignal.aborted){
+          var stopErr=new Error("Stopped by user");
+          stopErr.userStopped=true;
+          throw stopErr; // never retry a user-initiated stop
+        }
+        lastErr=e;
+        if(i===ret-1) break; // this provider is out of retries - try the next one
+        await sleep((i+1)*2000);
+      }
+    }
+  }
+  if(lastErr) throw lastErr;
+  throw new Error("No brain available: set LOCAL_MODEL_URL, configure gcloud, or set GROQ_API_KEY / CEREBRAS_API_KEY / OPENAI_API_KEY");
+}
 async function askChat(chatHistory, ret, abortSignal){
   ret=ret||3;
   stats.apiCalls++;
@@ -1991,6 +2053,9 @@ async function askChat(chatHistory, ret, abortSignal){
   var MODEL = process.env.GCP_MODEL || "gemini-2.5-flash"; 
 
   if (!cachedVertexToken || !PROJECT_ID) {
+    // No gcloud/Vertex on this machine: use whichever cloud key is configured
+    // rather than failing the turn outright.
+    if (cloudProviders().length) return await askCloudFallback(chatHistory, ret, abortSignal);
     throw new Error("Missing local credentials. Run 'gcloud auth login' and 'gcloud config set project YOUR_PROJECT_ID' once, then BRO will pick both up automatically from here on.");
   }
 
@@ -2059,6 +2124,12 @@ async function askChat(chatHistory, ret, abortSignal){
         throw stopErr; // never retry a user-initiated stop
       }
       if(i===ret-1){
+        // Vertex is unreachable/unauthorized - fall back to the cloud providers
+        // (Groq/Cerebras/OpenAI) before giving up on the turn.
+        if(cloudProviders().length){
+          try{ return await askCloudFallback(chatHistory, ret, abortSignal); }
+          catch(fbErr){ stats.errors++; saveStat(); throw e; }
+        }
         stats.errors++;
         saveStat();
         throw e;
