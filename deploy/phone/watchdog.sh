@@ -52,6 +52,13 @@ AUTO_RESUME="${FREE_BRAIN_AUTO_RESUME:-1}"
 # ~9 cycles per trip, so the remaining ~830 cycles needs ~95 trips. 200 leaves
 # room for the rate to worsen while still stopping a genuinely pathological run.
 MAX_TRIPS="${FREE_BRAIN_MAX_TRIPS:-200}"
+# A DRIFT ALARM (coherence under the floor for DRIFT_STREAK cycles) is an
+# OUTCOME of the study, not corruption: a noisy hosted model reaches it
+# occasionally. For an unattended 1000-cycle run the operator's intent is to
+# complete the target while recording every alarm, so it is auto-resumed too —
+# as a `drift-alarm-reset` event, distinct from a breaker reset, and it never
+# touches the coherence floor. MAX_ALARMS is the same kind of pathology guard.
+MAX_ALARMS="${FREE_BRAIN_MAX_ALARMS:-200}"
 LOG="${FREE_BRAIN_LOG:-$APP_DIR/drift-run.log}"
 RESIDENCE="${DRIVE_RESIDENCE:-freebrain-residence}"
 [[ "$RESIDENCE" = /* ]] || RESIDENCE="$APP_DIR/$RESIDENCE"
@@ -102,6 +109,16 @@ trip_count() {
   fi
 }
 
+alarm_count() {
+  # Drift alarms are recorded by the loop in operator-events.jsonl as their own
+  # event type, so counting them needs no extra watchdog state.
+  if [ -f "$RESIDENCE/operator-events.jsonl" ]; then
+    grep -c 'drift-alarm-reset' "$RESIDENCE/operator-events.jsonl" 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
 progress_marker() {
   # Bytes in the ledger: append-only, so growth is real progress. Falls back to
   # the checkpoint's cycle count before the first line exists.
@@ -114,8 +131,8 @@ progress_marker() {
 
 consecutive_fast_exits=0
 EXTRA_ARGS=""
-[ "$AUTO_RESUME" = "1" ] && EXTRA_ARGS="--resume-tripped"
-log "watchdog starting — model=$MODEL cycles=$CYCLES stall=${STALL_SECONDS}s budget=${LOCAL_MODEL_STREAM_BUDGET_MS}ms skip_local=$SKIP_LOCAL auto_resume=$AUTO_RESUME (trips so far: $(trip_count)/$MAX_TRIPS)"
+[ "$AUTO_RESUME" = "1" ] && EXTRA_ARGS="--resume-tripped --max-trips $MAX_TRIPS --max-alarms $MAX_ALARMS"
+log "watchdog starting — model=$MODEL cycles=$CYCLES stall=${STALL_SECONDS}s budget=${LOCAL_MODEL_STREAM_BUDGET_MS}ms skip_local=$SKIP_LOCAL auto_resume=$AUTO_RESUME (trips so far: $(trip_count)/$MAX_TRIPS, alarms: $(alarm_count)/$MAX_ALARMS)"
 
 while true; do
   if [ "$SKIP_LOCAL" = "1" ]; then
@@ -165,11 +182,14 @@ except Exception: print('?')
   ran=$(( $(date +%s) - started ))
   log "drift_loop exited rc=$rc after ${ran}s"
 
-  # rc=2 is the loop REFUSING to start a fresh run over an existing record
-  # (tripped breaker, or a different objective). Restarting cannot fix that — it
-  # would spin forever and bury the reason under restart noise — so stop and say
-  # what the operator's options are. Resuming keeps the original run id; starting
-  # a new run appends a second run id to the same ledger and forks the study.
+  # rc=2 means either (a) the loop REFUSING to start a fresh run over an existing
+  # record — a tripped breaker beyond --max-trips, or a different objective — or
+  # (b) the auto-resume cap was reached. Restarting cannot fix either: it would
+  # spin forever and bury the reason under restart noise. A mid-run trip that is
+  # still under the cap no longer reaches here at all, because the loop now
+  # auto-resumes it in-process (see --max-trips). Resuming keeps the original run
+  # id; starting a new run appends a second run id to the same ledger and forks
+  # the study, so refuse loudly and stop.
   if [ "$rc" -eq 2 ]; then
     log "TERMINAL: the loop declined to continue this record — see the lines above."
     log "  continue this run:  cd $APP_DIR && python3 drift_loop.py --cycles $CYCLES --resume-tripped"

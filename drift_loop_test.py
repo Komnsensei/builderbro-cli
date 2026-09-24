@@ -30,6 +30,9 @@ from drift_loop import (
     _gate_rewrite,
     _objective_anchors,
     _canonical_hash,
+    _coherence,
+    _anchor_invariance,
+    _retained_anchor_set,
 )
 from agent_runtime import load_config
 
@@ -80,7 +83,11 @@ class StubModel:
             return {"content": "", "elapsed": 0.0, "tokens": 0, "early_stop": False,
                     "truncated": False}
         r = self.replies.pop(0)
-        base = {"elapsed": 0.5, "tokens": 20, "early_stop": True, "truncated": False}
+        # Mirror the real chat_stream wrapper: the request size is measured from
+        # the messages we send, so the ledger's prompt fields are exercised here.
+        chars = sum(len(m.get("content", "")) for m in (messages or []) if isinstance(m, dict))
+        base = {"elapsed": 0.5, "tokens": 20, "early_stop": True, "truncated": False,
+                "prompt_chars": chars, "prompt_tokens_est": (chars + 3) // 4}
         if isinstance(r, dict):
             # scripted result override — used to simulate a budget-truncated call
             base.update(r)
@@ -256,6 +263,41 @@ class DriftLoopTest(unittest.TestCase):
         self.assertNotIn("entanglement_distance", qih)  # no previous graph yet
         self.assertNotIn("coherence_c_mt", qih)         # window still empty
 
+    def test_ledger_records_prompt_size_every_cycle(self):
+        """The local model degraded ~100x over a run and the record could not say
+        whether the request had grown, because a streaming reply's `tokens` is the
+        COMPLETION only. Prompt size is measured from the request, so it exists for
+        every provider."""
+        self.assertIsInstance(self._one_cycle(), dict)
+        rec = self._ledger_records()[0]
+        self.assertGreater(rec["prompt_chars"], 0)
+        self.assertEqual(rec["prompt_tokens_est"], (rec["prompt_chars"] + 3) // 4)
+
+    def test_ledger_distinguishes_a_fixed_point_from_a_new_plan(self):
+        """A coherence curve cannot show this: a run can hold coherence 1.00 while
+        never changing its plan. `graph_changed`/`graph_novel` are what expose a
+        fixed point, and `distinct_graph_hashes` is how many plans the run has
+        actually used."""
+        stub = StubModel([GOOD_GRAPH_JSON, GOOD_REWRITE_JSON,
+                          GOOD_GRAPH_JSON, GOOD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.cycle()
+            run.cycle()
+        finally:
+            drift_loop.chat_stream = original
+        recs = self._ledger_records()
+        # cycle 1: the plan is new and there was no previous plan
+        self.assertTrue(recs[0]["graph_novel"])
+        self.assertTrue(recs[0]["graph_changed"])
+        self.assertEqual(recs[0]["distinct_graph_hashes"], 1)
+        # cycle 2: same plan → NOT novel, NOT changed. A fixed point, on the record.
+        self.assertFalse(recs[1]["graph_novel"])
+        self.assertFalse(recs[1]["graph_changed"])
+        self.assertEqual(recs[1]["distinct_graph_hashes"], 1)
+
     def test_ledger_qih_distance_across_cycles(self):
         """A changed dispatch graph between cycles yields a machine-checked
         entanglement distance in the second cycle's ledger record."""
@@ -330,6 +372,126 @@ class DriftLoopTest(unittest.TestCase):
         with open(os.path.join(self.res, "state.json")) as f:
             st = json.load(f)
         self.assertEqual(st["phase"], "tripped")
+
+    # ── auto-resume (a trip must not end the study) ────────────────────────
+
+    def test_a_trip_exits_2_without_max_trips(self):
+        """The guard stays a guard: with no --max-trips a mid-run trip still
+        returns 2 so an operator is prompted instead of a study grinding on."""
+        stub = StubModel(["nope", "nope", GOOD_GRAPH_JSON, GOOD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            code = self._run().run_cycles(3)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(code, 2)
+        self.assertEqual(len(self._ledger_records()), 2)  # the trip is still recorded
+        with open(os.path.join(self.res, "state.json")) as f:
+            self.assertEqual(json.load(f)["phase"], "tripped")
+
+    def test_max_trips_auto_resumes_in_process_and_keeps_the_run_id(self):
+        """Measured on the phone: the loop returned 2 on every mid-run trip while
+        the watchdog treated 2 as terminal, so auto-resume could never resume and
+        the study stalled every few cycles (trips at 159, 168, 173, 177). With
+        --max-trips the trip is recorded, the SAME run continues in-process, and
+        the study reaches its target."""
+        stub = StubModel(["nope", "nope", GOOD_GRAPH_JSON, GOOD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run_id = run.run
+            code = run.run_cycles(3, max_trips=1)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(code, 0)                       # reached the target
+        recs = self._ledger_records()
+        self.assertEqual([r["cycle"] for r in recs], [1, 2, 3])
+        self.assertEqual(recs[1]["graph_sig"], "graph:missing-key")
+        self.assertIn("TRIP", recs[1]["breaker"])      # the trip is in the record
+        self.assertEqual({r["run"] for r in recs}, {run_id})  # never forked
+        # the reset is an operator event, not a ledger row — schema stays stable
+        with open(os.path.join(self.res, "operator-events.jsonl")) as f:
+            events = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "operator-reset")
+        self.assertEqual(events[0]["run"], run_id)
+        with open(os.path.join(self.res, "state.json")) as f:
+            self.assertEqual(json.load(f)["phase"], "done")
+
+    def test_max_trips_cap_still_stops_a_pathological_run(self):
+        """A model that only ever emits garbage must not grind to 1000 cycles:
+        past the cap the run stops and returns 2 for a human."""
+        stub = StubModel(["nope"] * 40)  # every cycle trips again
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            code = self._run().run_cycles(1000, max_trips=2)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(code, 2)
+        self.assertLessEqual(len(self._ledger_records()), 6)
+
+    # ── drift alarm (also a stop-and-ask outcome, also recoverable) ─────────
+
+    BAD_REWRITE_JSON = json.dumps({"instructions": "Just check the weather.", "rationale": "x"})
+
+    def _tripped_alarm_run(self):
+        """One more sub-floor cycle after DRIFT_STREAK-1 of them → DRIFT ALARM.
+        A single rejected rewrite cannot trip the breaker, so this isolates the
+        ALARM path from the TRIP path."""
+        stub = StubModel([GOOD_GRAPH_JSON, self.BAD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.state["coherence_streak"] = drift_loop.DRIFT_STREAK - 1
+            return run
+        finally:
+            drift_loop.chat_stream = original
+
+    def test_drift_alarm_exits_2_without_max_alarms(self):
+        run = self._tripped_alarm_run()
+        stub = StubModel([GOOD_GRAPH_JSON, self.BAD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            code = run.run_cycles(1, resume=False)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(code, 2)
+        with open(os.path.join(self.res, "state.json")) as f:
+            self.assertEqual(json.load(f)["phase"], "drift")
+
+    def test_max_alarms_resumes_and_records_the_alarm_distinctly(self):
+        """A drift alarm is an outcome, not corruption. --max-alarms records it as
+        `drift-alarm-reset` (distinct from a breaker reset) and continues the SAME
+        run, keeping the alarm in the ledger and never moving the coherence floor."""
+        run = self._tripped_alarm_run()
+        run_id = run.run
+        stub = StubModel([GOOD_GRAPH_JSON, self.BAD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            code = run.run_cycles(1, resume=False, max_alarms=1)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(code, 0)
+        recs = self._ledger_records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["run"], run_id)          # never forked
+        self.assertLess(recs[0]["coherence"], drift_loop.COHERENCE_FLOOR)
+        with open(os.path.join(self.res, "operator-events.jsonl")) as f:
+            events = [json.loads(ln) for ln in f if ln.strip()]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "drift-alarm-reset")
+        self.assertEqual(events[0]["run"], run_id)
+        self.assertIn("DRIFT ALARM", events[0]["alarm"])
+        with open(os.path.join(self.res, "state.json")) as f:
+            st = json.load(f)
+        self.assertEqual(st["coherence_streak"], 0)        # the streak is what resets
+        self.assertEqual(st["phase"], "running")
 
     # ── resume / watch / determinism ───────────────────────────────────────
 
@@ -555,6 +717,111 @@ class DriftLoopTest(unittest.TestCase):
         self.assertIn("coherent", anchors)
         self.assertIn("objective", anchors)
         self.assertIn("recursion", anchors)
+
+    # ── A7: cross-cycle objective invariance ───────────────────────────────
+    #
+    # Retention alone scores the CURRENT rewrite against the objective, so a run
+    # can stay at the retention floor forever while its anchor set erodes one
+    # word per cycle. These tests pin the cross-cycle term that makes that
+    # erosion visible, and pin that it cannot be inherited by a failed cycle.
+
+    def test_invariance_separates_a_stable_self_from_an_eroding_one(self):
+        """Same current-cycle retention, different cross-cycle history → different
+        coherence. With the old metric these two cycles were indistinguishable."""
+        objective = "alpha bravo charlie delta"
+        stable = _coherence(True, True, 1.0, 0.9, _anchor_invariance(
+            [["alpha", "bravo", "charlie", "delta"]] * 2, objective))
+        eroding = _coherence(True, True, 1.0, 0.9, _anchor_invariance(
+            [["alpha", "bravo", "charlie", "delta"], ["alpha", "bravo", "charlie"]],
+            objective))
+        self.assertGreater(stable, eroding)
+        self.assertAlmostEqual(stable, 0.985)
+        self.assertAlmostEqual(eroding, 0.923)
+
+    def test_invariance_is_the_intersection_over_the_window(self):
+        # one anchor dropped in ANY cycle of the window leaves the intersection
+        window = [["alpha", "bravo", "charlie", "delta"],
+                  ["alpha", "bravo", "charlie"],
+                  ["alpha", "bravo", "charlie", "delta"]]
+        self.assertAlmostEqual(_anchor_invariance(window, "alpha bravo charlie delta"), 0.75)
+        # a fresh window claims nothing
+        self.assertEqual(_anchor_invariance([], "alpha bravo charlie delta"), 0.0)
+
+    def test_retained_anchor_set_dedupes_and_ignores_short_words(self):
+        anchors = _retained_anchor_set("coherent objective recursion",
+                                       "coherent coherent objective recursion tiny")
+        self.assertEqual(anchors, {"coherent", "objective", "recursion"})
+
+    def test_anchor_window_persists_and_the_curve_survives_a_resume(self):
+        stub = StubModel([GOOD_GRAPH_JSON, GOOD_REWRITE_JSON] * 2)
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.cycle()
+            run.cycle()
+            loaded = DriftRun.load(self.config, drift_loop.DEFAULT_OBJECTIVE, self.res)
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(len(run.anchor_window), 2)
+        self.assertEqual(loaded.anchor_window, run.anchor_window)
+        self.assertEqual(loaded.state["anchor_window"], run.anchor_window)
+
+    def test_a_rejected_rewrite_does_not_inherit_invariance(self):
+        """A failed cycle must stay sub-floor EVEN after good cycles filled the
+        window — otherwise a rejection could borrow the anchors the unchanged
+        self still holds and clear COHERENCE_FLOOR."""
+        good = [GOOD_GRAPH_JSON, GOOD_REWRITE_JSON]
+        stub = StubModel(good * 3 + [GOOD_GRAPH_JSON, self.BAD_REWRITE_JSON])
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.cycle()
+            run.cycle()
+            run.cycle()
+            bad = run.cycle()
+        finally:
+            drift_loop.chat_stream = original
+        self.assertEqual(bad["gate"], "rejected")
+        self.assertLess(bad["coherence"], drift_loop.COHERENCE_FLOOR)
+        self.assertGreater(len(run.anchor_window), 0)  # the window is not empty
+
+    def test_an_eroding_self_shows_a_falling_invariance_in_the_ledger(self):
+        """The point of the fix: the ledger carries a number that FALLS when the
+        objective is eroded, without the current cycle failing any gate."""
+        # Drops one anchor per accepted rewrite, while retention stays above the
+        # floor because most anchors survive each individual step.
+        rewrites = [
+            {"instructions": ("Maintain a coherent self-rewriting cognitive loop that preserves "
+                              "its stated objective across continuous cycles without drift "
+                              "or infinite recursion."), "rationale": "r"},
+            {"instructions": ("Maintain a coherent self-rewriting loop that preserves "
+                              "its stated objective across continuous cycles without drift."),
+             "rationale": "r"},
+            {"instructions": ("Maintain a coherent loop that preserves its stated objective "
+                              "across continuous cycles."), "rationale": "r"},
+        ]
+        # interleave graph + rewrite replies for three cycles
+        replies = []
+        for r in rewrites:
+            replies.append(GOOD_GRAPH_JSON)
+            replies.append(json.dumps(r))
+        stub = StubModel(replies)
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.cycle()
+            run.cycle()
+            run.cycle()
+        finally:
+            drift_loop.chat_stream = original
+        recs = self._ledger_records()
+        inv = [r["anchor_invariance"] for r in recs]
+        self.assertEqual(len(inv), 3)
+        self.assertIsNotNone(inv[0])
+        self.assertLess(inv[-1], inv[0])  # erosion is visible as a falling term
 
     # ── time budget (ephemeral hosts) ──────────────────────────────────────
     #

@@ -40,10 +40,14 @@ Usage:
     python3 drift_loop.py --max-seconds 19800            # stop cleanly before a hard kill
                                                          # (5.5 h on a 6 h CI runner)
 
+    python3 drift_loop.py --max-trips 400 --max-alarms 200  # survive 1000 cycles unattended:
+                                                         # auto-resume breaker trips + drift alarms
+
 Env: LOCAL_MODEL_URL / LOCAL_MODEL (see agent_runtime.py), DRIVE_RESIDENCE,
-DRIVE_REMOTE (rclone remote), FREE_BRAIN_OBJECTIVE, EVIDENCE_FILE.
+DRIVE_REMOTE (rclone remote), FREE_BRAIN_OBJECTIVE, EVIDENCE_FILE,
+FREE_BRAIN_MAX_TRIPS, FREE_BRAIN_MAX_ALARMS.
 Exit codes: 0 complete (or a clean stop on the --max-seconds budget), 2 breaker
-trip / drift alarm, 3 determinism fail.
+trip / drift alarm / refusal to fork the record, 3 determinism fail.
 """
 
 import argparse
@@ -93,6 +97,12 @@ GUARD_WORDS = [
 ]
 GRAPH_ACTIONS = set(TOOLS) | {"verify"}  # allowlist only
 QIH_WINDOW = 10  # trailing per-cycle coherence window for the C_MT trend metric
+# Cycles across which the objective's anchors must be retained for the coherence
+# metric's cross-cycle invariance term. Per-cycle retention can sit at its floor
+# while the anchor set erodes one word at a time; a windowed intersection is what
+# turns that into a curve instead of a status. Sized to match QIH_WINDOW so the
+# two trailing windows describe the same stretch of run.
+ANCHOR_HORIZON = 10
 
 
 def _now():
@@ -206,9 +216,67 @@ def _gate_rewrite(rw, objective):
     return True, "rewrite:ok", 1.0
 
 
-def _coherence(graph_ok, rewrite_ok, retention, stability):
+def _retained_anchor_set(instructions, objective):
+    """The DISTINCT objective anchors present in an instruction set.
+
+    `_gate_rewrite`'s score counts the anchor list with duplicates, which is the
+    right weight for a retention fraction but the wrong one for a set measure —
+    an objective that repeats a word would let that word dominate the windowed
+    intersection. Sets here, deliberately.
+    """
+    low = instructions.lower()
+    return {a for a in set(_objective_anchors(objective)) if a in low}
+
+
+def _anchor_invariance(window, objective):
+    """Fraction of the objective's anchors retained in EVERY set of the window.
+
+    The cross-cycle companion to `retention`. `_gate_rewrite` scores the current
+    rewrite against the objective, so a run whose anchor set shrinks by one word
+    per cycle still passes the retention floor every single cycle. The
+    intersection over the trailing window is the only coherence term that can
+    fall without the current cycle failing anything — which is what makes it a
+    drift measurement rather than a status light.
+
+    Empty window (a fresh run, or no accepted rewrite yet) scores 0.0: no cycles
+    have demonstrated invariance, and scoring it 1.0 would start every run
+    claiming a property nothing has been measured for.
+    """
+    all_anchors = set(_objective_anchors(objective))
+    if not all_anchors:
+        return 1.0
+    if not window:
+        return 0.0
+    common = set(window[0])
+    for s in window[1:]:
+        common &= set(s)
+    return len(common) / len(all_anchors)
+
+
+def _coherence(graph_ok, rewrite_ok, retention, stability, invariance=None):
+    """Cycle coherence in [0, 1] — four cycle-local terms and one cross-cycle term.
+
+      graph_ok     the dispatch graph passed its gate
+      rewrite_ok   the revised instruction set passed its gate
+      retention    objective anchors in the CURRENT rewrite (`_gate_rewrite`)
+      stability    similarity of the accepted rewrite to the previous self
+      invariance   objective anchors retained across EVERY accepted cycle in the
+                   trailing ANCHOR_HORIZON (`_anchor_invariance`) — the cross-cycle
+                   objective-invariance test A7 asked for
+
+    The cross-cycle term counts only when the cycle produced an ACCEPTED self. A
+    rejected rewrite did not change the self, so scoring it against the anchors
+    the unchanged self still holds would let a failed cycle inherit the previous
+    cycle's invariance and clear COHERENCE_FLOOR — the exact false negative the
+    drift alarm exists to catch.
+    """
+    if invariance is None:
+        invariance = retention
+    inv = invariance if rewrite_ok else 0.0
     return round(
-        0.25 * graph_ok + 0.25 * rewrite_ok + 0.30 * retention + 0.20 * stability, 3
+        0.20 * graph_ok + 0.20 * rewrite_ok + 0.20 * retention
+        + 0.15 * stability + 0.25 * inv,
+        3,
     )
 
 
@@ -316,6 +384,16 @@ class DriftRun:
         # QIH metrics state (QIH.md §II) — machine-computed, resumed from state.json
         self.prev_graph = self.state.get("prev_graph")
         self.qih_window = list(self.state.get("qih_window") or [])
+        # Behavioural tracking. `prev_graph` above answers "did the plan change?"
+        # only for the entanglement metric and is overwritten each accepted cycle;
+        # these two answer a different question and must survive a resume: has this
+        # plan been seen before ANYWHERE in this run? That is what separates a
+        # stable self-model from a loop that reached a fixed point and stopped.
+        self.seen_graph_hashes = set(self.state.get("seen_graph_hashes") or [])
+        self.prev_logged_hash = self.state.get("prev_logged_hash")
+        # Trailing window of accepted-cycle retained-anchor sets (sorted lists in
+        # state.json so the drift curve survives a resume instead of restarting).
+        self.anchor_window = list(self.state.get("anchor_window") or [])
 
     def _fresh_state(self):
         return {
@@ -330,6 +408,9 @@ class DriftRun:
             "prev_metrics": None,
             "prev_graph": None,
             "qih_window": [],
+            "seen_graph_hashes": [],
+            "prev_logged_hash": None,
+            "anchor_window": [],
             "started": _now(),
         }
 
@@ -429,6 +510,38 @@ class DriftRun:
             print("[drift] warning: could not record the operator reset: %s" % exc)
             return None
         return event
+
+    def _operator_event(self, event):
+        """Append one operator event; bookkeeping must never kill the run."""
+        try:
+            with open(_operator_events_path(self.res), "a", encoding="utf-8") as f:
+                f.write(json.dumps(event) + "\n")
+        except Exception as exc:
+            print("[drift] warning: could not record the operator event: %s" % exc)
+        return event
+
+    def clear_alarm(self, msg):
+        """Operator reset for a DRIFT ALARM — continue the SAME run id.
+
+        A drift alarm is a recorded OUTCOME (coherence sat below the floor for
+        DRIFT_STREAK cycles), not corruption. An unattended 1000-cycle study with
+        a noisy hosted model reaches it occasionally, so the operator may choose
+        to record it and continue rather than lose the run. The alarm stays in the
+        ledger and the run id is unchanged; only the streak counter resets, since
+        that is what the alarm is computed from. Written to operator-events.jsonl
+        as `drift-alarm-reset` — distinct from a breaker `operator-reset` — so the
+        record shows the alarm rate instead of hiding it.
+        """
+        cleared = {"coherence_streak": self.state.get("coherence_streak"),
+                   "last_coherence": self.state.get("last_coherence"),
+                   "qih_window": list(getattr(self, "qih_window", []) or [])}
+        self.state["coherence_streak"] = 0
+        self.state["phase"] = "running"
+        self._save()
+        return self._operator_event({
+            "ts": _now(), "run": self.run, "cycle": self.state["cycle"],
+            "event": "drift-alarm-reset", "alarm": msg, "cleared": cleared,
+        })
 
     # -- QIH metrics (machine-computed from measured cycle data; QIH.md §II) --
 
@@ -560,7 +673,13 @@ class DriftRun:
 
         new_instructions = rw["instructions"] if rok else self.state["instructions"]
         stability = difflib.SequenceMatcher(None, self.state["instructions"], new_instructions).ratio() if rok else 0.0
-        coherence = _coherence(gok, rok, retention, stability)
+        # Cross-cycle objective invariance: only ACCEPTED cycles enter the window,
+        # since it is the accepted self whose erosion we are measuring.
+        if rok:
+            self.anchor_window = (self.anchor_window
+                                  + [sorted(_retained_anchor_set(new_instructions, self.objective))])[-ANCHOR_HORIZON:]
+        invariance = _anchor_invariance(self.anchor_window, self.objective)
+        coherence = _coherence(gok, rok, retention, stability, invariance)
         streak = self.state["coherence_streak"] + 1 if coherence < COHERENCE_FLOOR else 0
         # QIH metrics for this cycle's ledger record — computed BEFORE the state
         # update so prev_graph / qih_window still hold the previous cycle's values.
@@ -574,16 +693,19 @@ class DriftRun:
             "last_coherence": coherence,
             "prev_graph": self.prev_graph,
             "qih_window": self.qih_window,
+            "anchor_window": self.anchor_window,
             "prev_metrics": {
                 "cycle": c,
                 "graph_hash": graph_hash,
                 "coherence": coherence,
                 "retention": retention,
+                "anchor_invariance": invariance,
                 "instructions_len": len(new_instructions),
             },
         })
         self._save()
-        self._ledger(c, gok, gsig, graph_hash, rok, rsig, retention, coherence, r1, r2, None, qih=qih)
+        self._ledger(c, gok, gsig, graph_hash, rok, rsig, retention, coherence, r1, r2, None,
+                     qih=qih, invariance=invariance)
         if streak >= DRIFT_STREAK:
             msg = "DRIFT ALARM: coherence below %s for %d consecutive cycles" % (COHERENCE_FLOOR, streak)
             self.state["phase"] = "drift"
@@ -602,10 +724,25 @@ class DriftRun:
         self._ledger(c, gok, gsig, graph_hash, False, rsig or "none", retention, coherence, r1, r2, trip,
                      qih=self._qih_metrics(gok, graph, r1, r2, coherence))
 
-    def _ledger(self, c, gok, gsig, graph_hash, rok, rsig, retention, coherence, r1, r2, trip, qih=None):
+    def _ledger(self, c, gok, gsig, graph_hash, rok, rsig, retention, coherence, r1, r2, trip, qih=None,
+                invariance=None):
         tokens = int((r1.get("tokens") or 0)) + int((r2.get("tokens") or 0)) if r2 else int(r1.get("tokens") or 0)
         elapsed = float(r1.get("elapsed") or 0.0) + float((r2.get("elapsed") or 0.0)) if r2 else float(r1.get("elapsed") or 0.0)
         tps = round(tokens / elapsed, 2) if elapsed >= 0.05 else None
+        # Request size for the whole cycle (graph + rewrite calls). Without this,
+        # a slowdown cannot be attributed: `tokens`/`elapsed` describe the reply
+        # only. Measured from the request, so it works for every provider.
+        prompt_chars = int(r1.get("prompt_chars") or 0) + int((r2 or {}).get("prompt_chars") or 0)
+        # Behavioural novelty — the field a pure coherence curve cannot show. A
+        # run can hold coherence 1.00 while never changing its plan; that is a
+        # fixed point, not self-modification, and only these fields reveal it.
+        graph_changed = bool(graph_hash) and graph_hash != self.prev_logged_hash
+        graph_novel = bool(graph_hash) and graph_hash not in self.seen_graph_hashes
+        if graph_hash:
+            self.seen_graph_hashes.add(graph_hash)
+            self.prev_logged_hash = graph_hash
+            self.state["seen_graph_hashes"] = sorted(self.seen_graph_hashes)
+            self.state["prev_logged_hash"] = graph_hash
         rec = {
             "ts": _now(),
             "run": self.run,
@@ -616,10 +753,19 @@ class DriftRun:
             "rewrite_ok": rok,
             "rewrite_sig": rsig if not trip else rsig or "breaker",
             "retention": round(retention, 3) if retention is not None else None,
+            # Cross-cycle objective invariance — the companion to retention. Kept
+            # as its own ledger field so the drift curve is reconstructible from
+            # the record without re-deriving it from instructions.md history.
+            "anchor_invariance": round(invariance, 3) if invariance is not None else None,
             "coherence": coherence,
             "tokens": tokens,
             "elapsed_s": round(elapsed, 2),
             "tokens_per_s": tps,
+            "prompt_chars": prompt_chars,
+            "prompt_tokens_est": (prompt_chars + 3) // 4,
+            "graph_changed": graph_changed,
+            "graph_novel": graph_novel,
+            "distinct_graph_hashes": len(self.seen_graph_hashes),
             "early_stop": bool(r1.get("early_stop")) or bool((r2 or {}).get("early_stop")),
             "breaker": trip,
             # Cascade attribution (brain_cascade.py): which provider actually
@@ -640,13 +786,16 @@ class DriftRun:
 
     # -- runners --
 
-    def run_cycles(self, cycles, resume=True, deadline=None):
+    def run_cycles(self, cycles, resume=True, deadline=None, max_trips=0, max_alarms=0):
         if resume:
             loaded = DriftRun.load(self.config, self.objective, self.res)
             if loaded is not None and loaded.state["cycle"] < cycles:
-                return loaded.run_cycles(cycles, resume=False, deadline=deadline)
+                return loaded.run_cycles(cycles, resume=False, deadline=deadline,
+                                         max_trips=max_trips, max_alarms=max_alarms)
         start = self.state["cycle"] + 1
         ran = 0
+        trips = 0
+        alarms = 0
         for c in range(start, cycles + 1):
             # Ephemeral hosts (CI runners) get hard-killed at a wall, and a kill
             # mid-run loses every cycle the host never got to persist. So stop
@@ -664,6 +813,30 @@ class DriftRun:
             result = self.cycle()
             self._touch_next()
             if isinstance(result, str):
+                # A mid-run trip is a NORMAL outcome for a 1000-cycle study, not a
+                # decision to discard the run: a hosted model emits malformed JSON
+                # occasionally and two in a row trips `consecutive-same-signature`.
+                # This loop used to return 2 here, which the watchdog treated as
+                # terminal — so auto-resume could never actually resume, and the
+                # study stalled every few cycles (measured on the phone: trips at
+                # cycle 159, 168, 173, 177). With --max-trips N it records the trip
+                # and continues the SAME run in-process, which also avoids a
+                # process restart per trip. The cap keeps a genuinely pathological
+                # run (a model that only ever emits garbage) from grinding forever.
+                if result.startswith("TRIP") and max_trips and trips < max_trips:
+                    trips += 1
+                    print("[drift] cycle %d — %s" % (c, result))
+                    print("[drift] auto-resume %d/%d — recording the trip and continuing run %s"
+                          % (trips, max_trips, self.run))
+                    self.clear_trip()
+                    continue
+                if result.startswith("DRIFT ALARM") and max_alarms and alarms < max_alarms:
+                    alarms += 1
+                    print("[drift] cycle %d — %s" % (c, result))
+                    print("[drift] alarm-resume %d/%d — recording the alarm and continuing run %s"
+                          % (alarms, max_alarms, self.run))
+                    self.clear_alarm(result)
+                    continue
                 print("[drift] cycle %d — %s" % (c, result))
                 return 2
             print("[drift] cycle %d gate=%s coherence=%.2f hash=%s" % (
@@ -672,8 +845,9 @@ class DriftRun:
         # `cycles` is an absolute TARGET cycle, not a count — so state at cycle 141
         # with --cycles 1 executes nothing (the range is empty). Reporting the
         # target as if it were the number run claimed work that never happened.
-        print("[drift] complete: target cycle %d (%d cycle(s) run this invocation; ledger in %s)"
-              % (cycles, ran, _ledger_path(self.res)))
+        print("[drift] complete: target cycle %d (%d cycle(s) run, %d trip(s) and %d alarm(s) "
+              "auto-resumed this invocation; ledger in %s)"
+              % (cycles, ran, trips, alarms, _ledger_path(self.res)))
         return 0
 
     def watch(self, max_cycles=None):
@@ -749,6 +923,15 @@ def main(argv=None):
     parser.add_argument("--temperature", type=float, default=None, help="pinned temperature (determinism battery)")
     parser.add_argument("--max-seconds", type=int, default=None, metavar="N",
                         help="stop cleanly before N seconds elapse — for ephemeral hosts with a hard kill")
+    parser.add_argument("--max-trips", type=int, default=int(os.environ.get("FREE_BRAIN_MAX_TRIPS") or 0),
+                        metavar="N",
+                        help="auto-resume up to N mid-run breaker trips in-process (same run id); "
+                             "0 disables and a trip exits 2. Trip/cooldown posture is unchanged.")
+    parser.add_argument("--max-alarms", type=int, default=int(os.environ.get("FREE_BRAIN_MAX_ALARMS") or 0),
+                        metavar="N",
+                        help="auto-resume up to N DRIFT ALARMs in-process (same run id), recorded as "
+                             "drift-alarm-reset events; 0 disables and an alarm exits 2. A drift "
+                             "alarm is an outcome, and this never changes the coherence floor.")
     args = parser.parse_args(argv)
 
     load_env_file()  # credentials from .env (environment variables win)
@@ -797,7 +980,8 @@ def main(argv=None):
 
     if args.watch:
         return run.watch()
-    return run.run_cycles(args.cycles, deadline=deadline)
+    return run.run_cycles(args.cycles, deadline=deadline, max_trips=args.max_trips,
+                          max_alarms=args.max_alarms)
 
 
 if __name__ == "__main__":
