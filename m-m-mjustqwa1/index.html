@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AR Advertising MVP</title>
+    <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js/aframe/build/aframe-ar.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <a-scene embedded arjs="trackingMethod: best; sourceType: webcam; debugUIEnabled: false;" vr-mode-ui="enabled: false">
+        <!-- Marker definition (using the default Hiro marker) -->
+        <a-marker preset="hiro">
+            <!-- 3D ad: a rotating box with a texture -->
+            <a-entity id="ad-box" geometry="primitive: box; height: 1; width: 1; depth: 0.1"
+                      material="src: #ad-texture; side: double"
+                      position="0 0.5 0"
+                      rotation="0 0 0">
+            </a-entity>
+        </a-marker>
+        <a-entity camera></a-entity>
+    </a-scene>
+
+    <!-- Texture definition -->
+    <a-assets>
+        <img id="ad-texture" src="https://picsum.photos/512/256?random=1" crossorigin="anonymous">
+    </a-assets>
+
+    <script src="script.js"></script>
+</body>
+</html>

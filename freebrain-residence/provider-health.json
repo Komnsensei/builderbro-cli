@@ -1,56 +1,52 @@
 {
   "cerebras": {
     "cooldown_s": 3600,
-    "fails": 3,
+    "fails": 232,
     "last_class": "payment",
     "last_error": "cerebras HTTP 402 - {\"message\":\"Payment required to access this resource. Visit your billing tab.\",\"type\":\"payment_required_error\",\"param\":\"quota\",\"code\":\"payment_required\"}",
-    "last_fail": "2026-09-13T21:30:52+00:00",
+    "last_fail": "2026-09-23T12:19:22+00:00",
     "ok": false,
-    "total_fail": 3,
+    "total_fail": 232,
     "total_ok": 0,
-    "until": 1789338652.712
+    "until": 1790169562.723
   },
   "groq": {
-    "cooldown_s": 60,
-    "fails": 1,
-    "last_class": "rate-limit",
-    "last_error": "groq HTTP 429 - {\"error\":{\"message\":\"Rate limit reached for model `openai/gpt-oss-120b` in organization `org_01kph69fxxfyzb2kdxn45qsfer` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7236, Requested 992. Please try again in 1.71s. Need more tokens? Upgrade to Dev Tier today a",
-    "last_fail": "2026-09-19T10:47:05+00:00",
-    "ok": false,
-    "total_fail": 9,
-    "total_ok": 198,
-    "until": 1789814885.629
+    "fails": 0,
+    "last_ok": "2026-09-23T19:31:10+00:00",
+    "ok": true,
+    "total_fail": 600,
+    "total_ok": 509
   },
   "groq#2": {
     "fails": 0,
-    "last_ok": "2026-09-19T10:47:08+00:00",
+    "last_ok": "2026-09-23T12:19:21+00:00",
     "ok": true,
-    "total_fail": 7,
-    "total_ok": 83
+    "total_fail": 510,
+    "total_ok": 372
   },
   "groq#3": {
     "fails": 0,
-    "last_ok": "2026-09-19T10:40:50+00:00",
+    "last_ok": "2026-09-23T12:19:21+00:00",
     "ok": true,
-    "total_fail": 3,
-    "total_ok": 20
+    "total_fail": 413,
+    "total_ok": 305
   },
   "groq#4": {
     "fails": 0,
-    "last_ok": "2026-09-19T09:10:06+00:00",
+    "last_ok": "2026-09-23T12:19:22+00:00",
     "ok": true,
-    "total_fail": 0,
-    "total_ok": 6
+    "total_fail": 294,
+    "total_ok": 305
   },
   "local": {
     "cooldown_s": 30,
-    "fails": 32,
+    "fails": 793,
     "last_class": "server",
     "last_error": "local unreachable at http://127.0.0.1:11434/v1 (<urlopen error [Errno 111] Connection refused>) \u2014 is the server running?",
-    "last_fail": "2026-09-19T10:46:51+00:00",
+    "last_fail": "2026-09-23T19:31:09+00:00",
     "ok": false,
-    "total_fail": 47,
+    "total_fail": 808,
     "total_ok": 217,
-    "until": 1789814841.483
+    "until": 1790191899.604
   }
 }
