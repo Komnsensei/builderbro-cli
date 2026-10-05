@@ -74,6 +74,7 @@ from agent_runtime import (
 
 import brain_cascade
 import qih_metrics
+from qih_system.unified import run_cycle as run_unified_qih, append_ledger as append_unified_qih, chain_hash as unified_qih_hash
 
 # ── Constants (the pre-registered contract — the model cannot raise these) ────
 
@@ -582,6 +583,31 @@ class DriftRun:
             block["coherence_c_mt"] = qih_metrics.coherence_functional(
                 [(float(v), 0.0) for v in self.qih_window]
             )
+
+        # Unified QIH operator chain: the mathematical/geometry simulation now
+        # executes inside the same Free Brain cycle instead of living beside it.
+        # Its result is fed back into prev_metrics and persisted to the same
+        # residence. This is the integration seam: cognition -> QIH -> evidence
+        # -> next cognition cycle.
+        previous = self.state.get("prev_metrics") or {}
+        unified = run_unified_qih(
+            cycle=self.state["cycle"],
+            seed=self.state["cycle"] + 42,
+            threshold=0.85,
+            omega=tps if tps and tps > 0 else 1.0,
+            omega0=1.0,
+            previous=previous,
+            objective=self.objective,
+        )
+        block["unified"] = unified.to_dict()
+        block["unified_hash"] = unified_qih_hash(unified)
+        block["feedback"] = unified.feedback
+        try:
+            append_unified_qih(self.res, unified)
+        except OSError:
+            # The normal Free Brain ledger remains authoritative; a secondary
+            # telemetry failure must be visible but must not erase the cycle.
+            block["telemetry_error"] = "unified_qih_persistence_failed"
         return block
 
     # -- one cycle --
