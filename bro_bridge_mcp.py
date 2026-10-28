@@ -17,16 +17,141 @@ server.  Its tools are therefore exposed to a trusted session as
 
 import argparse
 import collections
+import hashlib
 import json
 import os
+import re
+import secrets
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import bro_bridge as bridge_mod  # noqa: E402
+
+MAX_VIDEO_RESPONSE_BYTES = 512 * 1024 * 1024
+VIDEO_DEFAULT_API_URL = "http://127.0.0.1:8000"
+
+
+class VideoToolError(RuntimeError):
+    """A video API/configuration failure that must not be mistaken for a render."""
+
+
+def _video_config():
+    base = (os.getenv("VIDEO_MCP_API_URL") or os.getenv("AI_CREATIVE_STUDIO_URL")
+            or VIDEO_DEFAULT_API_URL).strip().rstrip("/")
+    token = (os.getenv("VIDEO_MCP_API_TOKEN") or os.getenv("AI_CREATIVE_STUDIO_TOKEN")
+             or os.getenv("DEMO_TENANT_TOKEN") or "").strip()
+    output = Path(os.getenv("VIDEO_MCP_OUTPUT_DIR")
+                  or os.getenv("AI_CREATIVE_STUDIO_DOWNLOAD_DIR")
+                  or str(Path.home() / "Videos" / "AI_Creative_Studio")).expanduser().resolve()
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+        raise VideoToolError("VIDEO_MCP_API_URL must be an absolute HTTP(S) URL without embedded credentials")
+    if not token:
+        raise VideoToolError("Set VIDEO_MCP_API_TOKEN to a valid AI Creative Studio tenant bearer token")
+    return base, token, output
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward the tenant bearer token to a different origin."""
+    def __init__(self, origin):
+        super().__init__()
+        self.origin = origin
+
+    @staticmethod
+    def _origin(url):
+        parsed = urllib.parse.urlparse(url)
+        return parsed.scheme.lower(), parsed.hostname, parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if self._origin(newurl) != self.origin:
+            raise urllib.error.HTTPError(req.full_url, code, "cross-origin redirect blocked", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _video_request(method, path, *, payload=None, idempotency_key=None, expect_json=True):
+    base, token, _ = _video_config()
+    if not path.startswith("/") or path.startswith("//"):
+        raise VideoToolError("Internal video API path must start with one slash")
+    url = base + path
+    parsed = urllib.parse.urlparse(base)
+    origin = (parsed.scheme.lower(), parsed.hostname,
+              parsed.port or (443 if parsed.scheme.lower() == "https" else 80))
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json" if expect_json else "video/mp4"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if idempotency_key:
+        headers["X-Idempotency-Key"] = idempotency_key
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(_SameOriginRedirectHandler(origin))
+    try:
+        with opener.open(request, timeout=30) as response:
+            content_type = response.headers.get("Content-Type", "")
+            body = response.read(MAX_VIDEO_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(4096).decode("utf-8", "replace")
+        raise VideoToolError("Video API HTTP %s: %s" % (exc.code, detail[:1200])) from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise VideoToolError("Video API request failed; if generation submission timed out, reuse the same idempotency key and check job status before retrying: %s" % exc) from exc
+    if len(body) > MAX_VIDEO_RESPONSE_BYTES:
+        raise VideoToolError("Video API response exceeded the 512 MiB limit")
+    if not expect_json:
+        return content_type, body
+    if "json" not in content_type.lower():
+        raise VideoToolError("Video API returned a non-JSON response where JSON was expected")
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise VideoToolError("Video API returned invalid JSON") from exc
+    if not isinstance(result, dict):
+        raise VideoToolError("Video API JSON response must be an object")
+    return result
+
+
+def _video_engine_status():
+    return _video_request("GET", "/v1/videos/engine")
+
+
+def _video_preflight():
+    engine = _video_engine_status()
+    providers = engine.get("configured_providers") or []
+    allowed = {item.strip() for item in
+               (os.getenv("VIDEO_MCP_FREE_PROVIDER_ALLOWLIST")
+                or os.getenv("VIDEO_FREE_PROVIDER_ALLOWLIST") or "").split(",") if item.strip()}
+    reasons = []
+    if engine.get("configured") is not True:
+        reasons.append(engine.get("message") or "no real video renderer is configured")
+    if not providers:
+        reasons.append("the engine did not report any configured real renderer")
+    if not allowed:
+        reasons.append("the zero-cost provider allowlist is empty")
+    unapproved = sorted(set(providers) - allowed)
+    if unapproved:
+        reasons.append("provider(s) not attested as zero-cost: " + ", ".join(unapproved))
+    return {
+        "decision": "PASS" if not reasons else "BLOCKED",
+        "policy": "zero-cost-only",
+        "configured_providers": providers,
+        "allowlisted_providers": sorted(allowed),
+        "reasons": reasons,
+        "note": "The allowlist is an operator attestation, not independent proof of billing terms."
+    }
+
+
+def _safe_video_job_id(value):
+    job_id = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", job_id):
+        raise ValueError("job_id contains invalid characters")
+    return job_id
+
 
 SERVER_NAME = "bro-bridge"
 SERVER_VERSION = "1.0"
@@ -186,6 +311,95 @@ class BridgeMCP(object):
             frame = dict(frame, signals=self.close())
         return frame
 
+    def tool_video_engine_status(self, args):
+        return _video_engine_status()
+
+    def tool_video_preflight(self, args):
+        return _video_preflight()
+
+    def tool_generate_video(self, args):
+        preflight = _video_preflight()
+        if preflight["decision"] != "PASS":
+            return {"ok": False, **preflight, "submitted": False}
+        prompt = args.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("`prompt` must be a non-empty string")
+        duration = args.get("duration_seconds", 5)
+        if isinstance(duration, bool) or not isinstance(duration, int) or not 1 <= duration <= 30:
+            raise ValueError("`duration_seconds` must be an integer from 1 to 30")
+        key = str(args.get("idempotency_key") or secrets.token_urlsafe(24)).strip()
+        if not key or len(key) > 200:
+            raise ValueError("`idempotency_key` must contain 1–200 characters")
+        payload = {
+            "prompt": prompt.strip(),
+            "provider": "video-cascade",
+            "duration_seconds": duration,
+            "aspect_ratio": args.get("aspect_ratio", "16:9"),
+            "resolution": args.get("resolution", "720p"),
+            "fps": args.get("fps", 24),
+        }
+        for field in ("negative_prompt", "model", "shots"):
+            if field in args:
+                payload[field] = args[field]
+        try:
+            result = _video_request("POST", "/v1/videos/generate",
+                                    payload=payload, idempotency_key=key)
+        except VideoToolError as exc:
+            raise VideoToolError("%s; idempotency_key=%s (reuse this exact key; do not create a new job)" % (exc, key)) from exc
+        result["idempotency_key"] = key
+        result["preflight"] = preflight
+        result["next_action"] = "Poll video_job_status with this job_id; download only after status is succeeded and simulated is false."
+        return result
+
+    def tool_video_job_status(self, args):
+        job_id = _safe_video_job_id(args.get("job_id"))
+        return _video_request("GET", "/v1/videos/jobs/" + urllib.parse.quote(job_id, safe=""))
+
+    def tool_video_download(self, args):
+        job_id = _safe_video_job_id(args.get("job_id"))
+        status = _video_request("GET", "/v1/videos/jobs/" + urllib.parse.quote(job_id, safe=""))
+        if status.get("status") != "succeeded":
+            raise VideoToolError("video is not ready; current status is %r" % status.get("status"))
+        if status.get("simulated") is True:
+            raise VideoToolError("refusing to download simulated output as a real video")
+        result = _video_request("GET", "/v1/videos/jobs/" + urllib.parse.quote(job_id, safe="") + "/result")
+        asset = result.get("asset") or {}
+        if result.get("simulated") is True or asset.get("simulated") is True:
+            raise VideoToolError("refusing to download simulated output as a real video")
+        asset_id = str(asset.get("asset_id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", asset_id):
+            raise VideoToolError("video result did not contain a valid asset_id")
+        content_type, data = _video_request(
+            "GET", "/v1/assets/" + urllib.parse.quote(asset_id, safe="") + "/download",
+            expect_json=False)
+        if "video/mp4" not in content_type.lower() or len(data) < 12 or data[4:8] != b"ftyp":
+            raise VideoToolError("download is not a valid MP4 response")
+        digest = hashlib.sha256(data).hexdigest()
+        claimed = asset.get("checksum_sha256")
+        if claimed and str(claimed).lower() != digest:
+            raise VideoToolError("downloaded MP4 checksum does not match the asset record")
+        _, _, output_root = _video_config()
+        filename = str(args.get("filename") or (job_id + ".mp4"))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\\.mp4", filename, re.IGNORECASE):
+            raise ValueError("filename must be a simple filename ending in .mp4")
+        output_root.mkdir(parents=True, exist_ok=True)
+        target = (output_root / filename).resolve()
+        if target.parent != output_root:
+            raise ValueError("filename escapes the configured output directory")
+        temp = target.with_suffix(".mp4.part")
+        try:
+            temp.write_bytes(data)
+            temp.replace(target)
+        except OSError as exc:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise VideoToolError("could not save MP4: %s" % exc) from exc
+        return {"ok": True, "job_id": job_id, "status": "succeeded",
+                "simulated": False, "saved_path": str(target), "size_bytes": len(data),
+                "checksum_sha256": digest, "provider": asset.get("provider")}
+
 
 TOOLS = collections.OrderedDict([
     ("bridge_status", {
@@ -290,6 +504,45 @@ TOOLS = collections.OrderedDict([
             "is terminal for the current bridge session."
         ),
         "inputSchema": {"type": "object", "properties": {}},
+    }),
+    ("video_engine_status", {
+        "handler": BridgeMCP.tool_video_engine_status,
+        "description": "Check the existing AI Creative Studio video API and report configured real render targets. Does not submit a job.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }),
+    ("video_preflight", {
+        "handler": BridgeMCP.tool_video_preflight,
+        "description": "Read-only zero-cost gate. Requires a configured real renderer and every configured target explicitly listed in VIDEO_MCP_FREE_PROVIDER_ALLOWLIST or VIDEO_FREE_PROVIDER_ALLOWLIST.",
+        "inputSchema": {"type": "object", "properties": {}},
+    }),
+    ("generate_video", {
+        "handler": BridgeMCP.tool_generate_video,
+        "description": "Submit one idempotent durable video job to the existing AI Creative Studio real cascade after zero-cost preflight. A returned job ID means accepted, not rendered.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5},
+                "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1", "4:3", "3:4"], "default": "16:9"},
+                "resolution": {"type": "string", "enum": ["720p", "1080p"], "default": "720p"},
+                "fps": {"type": "integer", "enum": [24, 30, 60], "default": 24},
+                "negative_prompt": {"type": "string", "maxLength": 1000},
+                "model": {"type": "string", "maxLength": 160},
+                "shots": {"type": "array", "maxItems": 8, "items": {"type": "object"}},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 200},
+            },
+            "required": ["prompt"],
+        },
+    }),
+    ("video_job_status", {
+        "handler": BridgeMCP.tool_video_job_status,
+        "description": "Poll the exact existing video job and its durable status. Do not resubmit after a timeout.",
+        "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string", "minLength": 1, "maxLength": 200}}, "required": ["job_id"]},
+    }),
+    ("video_download", {
+        "handler": BridgeMCP.tool_video_download,
+        "description": "Save a completed non-simulated MP4 under the configured output directory after checking media type, MP4 signature and SHA-256 checksum.",
+        "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string", "minLength": 1, "maxLength": 200}, "filename": {"type": "string", "maxLength": 124}}, "required": ["job_id"]},
     }),
 ])
 
