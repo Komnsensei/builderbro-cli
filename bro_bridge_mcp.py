@@ -380,7 +380,7 @@ class BridgeMCP(object):
             raise VideoToolError("downloaded MP4 checksum does not match the asset record")
         _, _, output_root = _video_config()
         filename = str(args.get("filename") or (job_id + ".mp4"))
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\\.mp4", filename, re.IGNORECASE):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\.mp4", filename, re.IGNORECASE):
             raise ValueError("filename must be a simple filename ending in .mp4")
         output_root.mkdir(parents=True, exist_ok=True)
         target = (output_root / filename).resolve()
