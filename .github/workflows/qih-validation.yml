@@ -1,0 +1,29 @@
+name: QIH deterministic validation
+
+on:
+  push:
+    branches:
+      - feat/qih-completion
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qih-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile QIH runtime and integration
+        run: python -m compileall -q qih_system drift_loop.py
+      - name: Run QIH operator and 1,000-cycle study tests
+        run: python -m unittest -v qih_system.test_unified qih_system.test_study
+      - name: Run Free Brain feedback integration tests
+        run: python -m unittest -v drift_loop_test
