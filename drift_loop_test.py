@@ -326,6 +326,22 @@ class DriftLoopTest(unittest.TestCase):
             st = json.load(f)
         self.assertIn("read_file", st["prev_graph"])
 
+    def test_qih_feedback_reaches_the_next_planner_context(self):
+        stub = StubModel([GOOD_GRAPH_JSON, GOOD_REWRITE_JSON] * 2)
+        original = drift_loop.chat_stream
+        drift_loop.chat_stream = stub
+        try:
+            run = self._run()
+            run.cycle()
+            run.cycle()
+        finally:
+            drift_loop.chat_stream = original
+        # Calls 0/1 are cycle 1; call 2 is cycle 2's graph planner.
+        planner_input = stub.calls[2]["messages"][-1]["content"]
+        self.assertIn("qih_feedback", planner_input)
+        self.assertIn("coherence_threshold_met", planner_input)
+        self.assertIn("qih_hash", planner_input)
+
     def test_rejected_rewrite_keeps_previous_instructions(self):
         bad = {"instructions": "Just check the weather.", "rationale": "x"}
         stub = StubModel([GOOD_GRAPH_JSON, json.dumps(bad)])
