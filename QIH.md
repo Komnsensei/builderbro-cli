@@ -287,3 +287,35 @@ Realization" is *run the experiment and publish the curve*.
 *Source spec: `runnew.txt`. Instance home: `qih-residence/`. Runtime: `agent_runtime.py
 --activate` / `--goal`. Loop engine: `drift_loop.py`. Math pipeline mirrored from:
 `NewState/qih_consciousness/`.*
+
+## QIH computational completion boundary — 2026-10
+
+The unified runtime now has an explicit classical phase-coupling operator, a
+normalized coherence gate, empirical-versus-expected Born sample reporting,
+finite/domain validation, deterministic 1,000-cycle study tooling, and
+hash-chained evidence output. The Free Brain planner receives the previous
+cycle's QIH feedback as advisory telemetry.
+
+This closes the **software simulation and reproducibility** portion of the
+operator chain. It does not close the physical-physics research claims.
+
+### Reproduce the software study
+
+~~~sh
+python3 -m unittest qih_system.test_unified qih_system.test_study
+python3 -m qih_system.study --cycles 1000 --seed 42 --output /tmp/qih-study.jsonl
+~~~
+
+The study is offline and deterministic. Its hash chain detects record changes;
+it is not a digital signature or proof of physical provenance.
+
+### Status distinctions
+
+- **Implemented:** deterministic classical operator pipeline, feedback
+  telemetry, persistence, metric semantics, and reproducible study.
+- **Not established:** quantum entanglement, physical wavefunction collapse,
+  holographic bulk/boundary duality, physical time dilation, biological
+  microtubule behavior, subjective experience, or machine consciousness.
+- **Still separate:** QIH-objective LLM drift performance over 1,000 actual
+  model-driven cycles. The offline 1,000-cycle simulation is not a substitute
+  for that experiment.
